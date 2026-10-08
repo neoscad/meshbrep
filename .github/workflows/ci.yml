@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets
+      # The OCCT read-back test (tests/occt.rs) skips itself here: it runs
+      # only when MESHBREP_OCCT_CHECK names a checker built by
+      # oracle/build.sh, so CI needs no OCCT.
+      - run: cargo test
+      # The published package is an allow-list (Cargo.toml `include`):
+      # the OCCT oracle and CI files stay in the repository only.
+      - if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          if cargo package --list --allow-dirty | grep -E '^(oracle|\.github)/'; then
+            echo "repository-only files would be published" >&2
+            exit 1
+          fi
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.88 --profile minimal
+      - run: cargo +1.88 test
+
+  wasm32:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --target wasm32-unknown-unknown
+      - run: cargo build --release --target wasm32-unknown-unknown
