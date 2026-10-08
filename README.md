@@ -179,6 +179,34 @@ a STEP read-back checker for an optional test:
 Without `MESHBREP_OCCT_CHECK` the test skips itself. OCCT is a test tool
 only, never a dependency.
 
+## Blend tools
+
+`blend::tools(&spec, segments)` makes the solids that round or chamfer
+edges when a mesh kernel subtracts them (convex edges) or adds
+them (concave ones): for each edge between two planes at any angle, or a
+plane and a parallel cylinder, or two parallel cylinders, a constant-radius
+fillet (a cylinder blend) or an equal-distance chamfer (a plane), swept
+between end planes (a face the edge runs into, a mitre, the plane across a
+tangent continuation) or run on into the air; and sphere patches where
+three filleted edges meet between three planes. Every triangle is tagged
+with its exact surface, and the arcs have vertices exactly on the tangent
+lines, so the boolean's result reconstructs with true blend faces.
+`blend::section` gives an edge's cross-section (centre, tangent points,
+how far into each face) for checks before anything is built. The edges of
+a sphere corner and its patch come out as one solid, so no two tools share
+a face.
+
+Circular edges (`Path::Arc`) between surfaces of revolution about one
+axis (a plane square to it, a coaxial cylinder, cone or torus, a sphere
+centred on it) get the same cross-section in the meridian half-plane,
+revolved: a torus blend for a fillet, a cone (or plane, or cylinder) for
+a chamfer. The caller gives the angles to put its sections at, those of
+the polygon the face beside the edge has in the mesh the tool is applied
+to, and how far each of that polygon's vertices lies off the exact
+circle, so the tool's tangent ring runs through the polygon's own
+vertices. Edges that run on into each other (`End::Chain`: a rounded
+rectangle's lines and arcs) come out as one solid.
+
 ## Licence
 
 Licensed under either of
