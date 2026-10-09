@@ -114,9 +114,14 @@ pub(crate) fn param_of(c: &Curve, p: V) -> f64 {
 
 /// `n + 1` points evenly spaced in parameter over `range`.
 pub(crate) fn sample(c: &Curve, range: [f64; 2], n: usize) -> Vec<V> {
-    (0..=n)
-        .map(|i| eval(c, range[0] + (range[1] - range[0]) * i as f64 / n as f64))
-        .collect()
+    samples(c, range, n).collect()
+}
+
+/// [`sample`]'s points one by one, for a caller that only folds them (the
+/// validator does, once or twice per edge of a model with hundreds of
+/// thousands).
+pub(crate) fn samples(c: &Curve, range: [f64; 2], n: usize) -> impl Iterator<Item = V> + '_ {
+    (0..=n).map(move |i| eval(c, range[0] + (range[1] - range[0]) * i as f64 / n as f64))
 }
 
 /// How many samples an edge needs for a faithful polyline: conics by

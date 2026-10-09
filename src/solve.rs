@@ -85,7 +85,10 @@ pub(crate) fn solve(surfs: &[Surf], p0: V) -> (V, f64) {
             break;
         }
         p = p + step;
-        fg = surfs.iter().map(|s| s.f_grad(p)).collect();
+        // In place, not a vector per step: a model has a solve per corner,
+        // hundreds of thousands on a large one.
+        fg.clear();
+        fg.extend(surfs.iter().map(|s| s.f_grad(p)));
         res = resid(&fg);
         if step.len() < 1e-16 * (1.0 + p.len()) {
             break;

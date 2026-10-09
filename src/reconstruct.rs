@@ -647,11 +647,12 @@ pub(crate) fn build(
 
     // 7. Exact vertices, one per corner mesh vertex (or per closed chain).
     let mut topo = Topo::default();
-    let mut vmap: BTreeMap<usize, usize> = BTreeMap::new();
+    // The B-rep vertex of each mesh vertex placed so far.
+    let mut vmap: Vec<usize> = vec![NONE; np];
     let mut max_res = 0.0f64;
     let mut vertex_for = |p: usize, cl: &[usize], topo: &mut Topo| -> usize {
-        if let Some(&i) = vmap.get(&p) {
-            return i;
+        if vmap[p] != NONE {
+            return vmap[p];
         }
         let all;
         let cl = if cl.is_empty() {
@@ -663,7 +664,7 @@ pub(crate) fn build(
         let (q, res) = place_vertex(p, cl, &cls, &pos, tangent_at[p], &contact_of);
         max_res = max_res.max(res);
         let i = topo.add_vertex(q);
-        vmap.insert(p, i);
+        vmap[p] = i;
         i
     };
     let mut built: Vec<Option<TEdge>> = Vec::with_capacity(chains.len());
@@ -1181,14 +1182,33 @@ fn reverse_chain(c: &mut Chain, twin: &[usize]) {
 /// Half-edge twins, or an error if the mesh is not a 2-manifold.
 fn twins(tris: &[[usize; 3]]) -> Result<Vec<usize>, Error> {
     let n = 3 * tris.len();
-    let mut keys: Vec<(usize, usize, usize)> = Vec::with_capacity(n);
+    // The half-edges sorted by (lower end, upper end, half-edge): bucketed
+    // by the lower end first (a counting sort), then each small bucket
+    // sorted. One sort of every half-edge's triple was a tenth of a large
+    // model's reconstruction.
+    let np = tris.iter().flatten().copied().max().map_or(0, |m| m + 1);
+    let mut start = vec![0usize; np + 1];
+    for tri in tris {
+        for k in 0..3 {
+            start[tri[k].min(tri[(k + 1) % 3]) + 1] += 1;
+        }
+    }
+    for i in 0..np {
+        start[i + 1] += start[i];
+    }
+    let mut fill = start.clone();
+    let mut keys: Vec<(usize, usize, usize)> = vec![(0, 0, 0); n];
     for (t, tri) in tris.iter().enumerate() {
         for k in 0..3 {
             let (a, b) = (tri[k], tri[(k + 1) % 3]);
-            keys.push((a.min(b), a.max(b), 3 * t + k));
+            let lo = a.min(b);
+            keys[fill[lo]] = (lo, a.max(b), 3 * t + k);
+            fill[lo] += 1;
         }
     }
-    keys.sort_unstable();
+    for w in start.windows(2) {
+        keys[w[0]..w[1]].sort_unstable();
+    }
     let mut twin = vec![usize::MAX; n];
     let mut i = 0;
     while i < n {

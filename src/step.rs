@@ -106,35 +106,98 @@ fn push_real(out: &mut String, x: f64, scratch: &mut String) {
     }
 }
 
+/// A decimal integer appended to `out`, without the formatting machinery
+/// (entity numbers are most of a large file's integers).
+fn push_uint(out: &mut String, mut v: usize) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for &b in &buf[i..] {
+        out.push(char::from(b));
+    }
+}
+
+/// The entities written so far.
+///
+/// Each is appended to one buffer as its `#n=…;` line as soon as it is
+/// added, in number order. Collecting every entity as a string of its own
+/// and joining them at the end cost as much as formatting the numbers on
+/// a large faceted model (a million allocations and a second copy of the
+/// file). An entity reserved before its text is known is spliced in when
+/// the file is assembled.
 struct W {
-    out: Vec<String>,
+    body: String,
+    /// Entities numbered so far.
+    n: usize,
     scratch: String,
+    /// Reserved entities: number, offset in `body`, and text once set.
+    holes: Vec<(usize, usize, String)>,
 }
 
 impl W {
+    fn new() -> W {
+        W {
+            body: String::new(),
+            n: 0,
+            scratch: String::new(),
+            holes: Vec::new(),
+        }
+    }
+    /// Starts entity `#n=` and returns its number.
+    fn start(&mut self) -> usize {
+        self.n += 1;
+        self.body.push('#');
+        push_uint(&mut self.body, self.n);
+        self.body.push('=');
+        self.n
+    }
+    fn finish(&mut self) {
+        self.body.push_str(";\n");
+    }
     fn add(&mut self, s: String) -> usize {
-        self.out.push(s);
-        self.out.len()
+        let id = self.start();
+        self.body.push_str(&s);
+        self.finish();
+        id
+    }
+    /// [`W::add`] of formatted text, without a string of its own.
+    fn addf(&mut self, args: std::fmt::Arguments<'_>) -> usize {
+        let id = self.start();
+        let _ = self.body.write_fmt(args);
+        self.finish();
+        id
     }
     fn reserve(&mut self) -> usize {
-        self.add(String::new())
+        self.n += 1;
+        self.holes.push((self.n, self.body.len(), String::new()));
+        self.n
     }
     fn set(&mut self, id: usize, s: String) {
-        self.out[id - 1] = s;
+        if let Some(h) = self.holes.iter_mut().find(|h| h.0 == id) {
+            h.2 = s;
+        }
     }
     /// `KIND('',(x,y,...))`.
     fn tuple(&mut self, kind: &str, xs: &[f64]) -> usize {
-        let mut s = String::with_capacity(kind.len() + 8 + 24 * xs.len());
-        s.push_str(kind);
-        s.push_str("('',(");
+        let id = self.start();
+        self.body.push_str(kind);
+        self.body.push_str("('',(");
         for (i, &x) in xs.iter().enumerate() {
             if i > 0 {
-                s.push(',');
+                self.body.push(',');
             }
-            push_real(&mut s, x, &mut self.scratch);
+            push_real(&mut self.body, x, &mut self.scratch);
         }
-        s.push_str("))");
-        self.add(s)
+        self.body.push_str("))");
+        self.finish();
+        id
     }
     fn pt(&mut self, p: [f64; 3]) -> usize {
         self.tuple("CARTESIAN_POINT", &p)
@@ -149,19 +212,39 @@ impl W {
         let p = self.pt(o);
         let a = self.dir(z);
         let b = self.dir(x);
-        self.add(format!("AXIS2_PLACEMENT_3D('',#{p},#{a},#{b})"))
+        self.addf(format_args!("AXIS2_PLACEMENT_3D('',#{p},#{a},#{b})"))
+    }
+    /// The DATA section's lines, reserved entities in their places.
+    fn into_data(self, out: &mut String) {
+        let mut at = 0;
+        let mut holes = self.holes;
+        holes.sort_by_key(|h| h.1);
+        for (id, off, text) in holes {
+            out.push_str(&self.body[at..off]);
+            out.push('#');
+            push_uint(out, id);
+            out.push('=');
+            out.push_str(&text);
+            out.push_str(";\n");
+            at = off;
+        }
+        out.push_str(&self.body[at..]);
     }
 }
 
-fn refs(ids: &[usize]) -> String {
-    let mut s = String::with_capacity(8 * ids.len());
-    for (k, i) in ids.iter().enumerate() {
-        if k > 0 {
-            s.push(',');
+/// `#a,#b,...`, formatted where it is used.
+struct Refs<'a>(&'a [usize]);
+
+impl std::fmt::Display for Refs<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (k, i) in self.0.iter().enumerate() {
+            if k > 0 {
+                f.write_str(",")?;
+            }
+            write!(f, "#{i}")?;
         }
-        let _ = write!(s, "#{i}");
+        Ok(())
     }
-    s
 }
 
 fn bspline_entity<const D: usize>(w: &mut W, b: &BSpline<D>) -> usize {
@@ -186,10 +269,10 @@ fn bspline_entity<const D: usize>(w: &mut W, b: &BSpline<D>) -> usize {
             ms.push(1);
         }
     }
-    w.add(format!(
+    w.addf(format_args!(
         "B_SPLINE_CURVE_WITH_KNOTS('',{},({}),.UNSPECIFIED.,.F.,.F.,({}),({}),.UNSPECIFIED.)",
         b.degree,
-        refs(&cps),
+        Refs(&cps),
         ms.iter()
             .map(|m| m.to_string())
             .collect::<Vec<_>>()
@@ -203,8 +286,8 @@ fn curve_entity(w: &mut W, c: &Curve) -> usize {
         Curve::Line { origin, direction } => {
             let p = w.pt(*origin);
             let d = w.dir(*direction);
-            let vct = w.add(format!("VECTOR('',#{d},1.)"));
-            w.add(format!("LINE('',#{p},#{vct})"))
+            let vct = w.addf(format_args!("VECTOR('',#{d},1.)"));
+            w.addf(format_args!("LINE('',#{p},#{vct})"))
         }
         Curve::Circle {
             center,
@@ -213,7 +296,7 @@ fn curve_entity(w: &mut W, c: &Curve) -> usize {
             radius,
         } => {
             let a = w.ax2(*center, *normal, *x_axis);
-            w.add(format!("CIRCLE('',#{a},{})", real(*radius)))
+            w.addf(format_args!("CIRCLE('',#{a},{})", real(*radius)))
         }
         Curve::Ellipse {
             center,
@@ -223,7 +306,7 @@ fn curve_entity(w: &mut W, c: &Curve) -> usize {
             minor,
         } => {
             let a = w.ax2(*center, *normal, *x_axis);
-            w.add(format!(
+            w.addf(format_args!(
                 "ELLIPSE('',#{a},{},{})",
                 real(*major),
                 real(*minor)
@@ -269,7 +352,7 @@ fn bspline_surface_entity(w: &mut W, b: &BSplineSurface) -> usize {
         .iter()
         .map(|row| {
             let ids: Vec<usize> = row.iter().map(|&p| w.pt(p)).collect();
-            format!("({})", refs(&ids))
+            format!("({})", Refs(&ids))
         })
         .collect();
     let net = format!("({})", rows.join(","));
@@ -283,13 +366,13 @@ fn bspline_surface_entity(w: &mut W, b: &BSplineSurface) -> usize {
         real_list(&kv)
     );
     match &b.weights {
-        None => w.add(format!(
+        None => w.addf(format_args!(
             "B_SPLINE_SURFACE_WITH_KNOTS('',{},{},{net},.UNSPECIFIED.,.F.,.F.,.F.,{knots})",
             b.degree_u, b.degree_v
         )),
         Some(ws) => {
             let rows: Vec<String> = ws.iter().map(|r| real_list(r)).collect();
-            w.add(format!(
+            w.addf(format_args!(
                 "(BOUNDED_SURFACE()B_SPLINE_SURFACE({},{},{net},.UNSPECIFIED.,.F.,.F.,.F.)B_SPLINE_SURFACE_WITH_KNOTS({knots})GEOMETRIC_REPRESENTATION_ITEM()RATIONAL_B_SPLINE_SURFACE(({}))REPRESENTATION_ITEM('')SURFACE())",
                 b.degree_u,
                 b.degree_v,
@@ -308,16 +391,17 @@ fn surface_entity(w: &mut W, f: &Face) -> usize {
     let fr = f.frame;
     let a = w.ax2(fr.origin, fr.z, fr.x);
     match &f.surface {
-        Surface::Cylinder { radius, .. } => {
-            w.add(format!("CYLINDRICAL_SURFACE('',#{a},{})", real(*radius)))
-        }
-        Surface::Cone { slope, .. } => w.add(format!(
+        Surface::Cylinder { radius, .. } => w.addf(format_args!(
+            "CYLINDRICAL_SURFACE('',#{a},{})",
+            real(*radius)
+        )),
+        Surface::Cone { slope, .. } => w.addf(format_args!(
             "CONICAL_SURFACE('',#{a},{},{})",
             real(f.ref_radius),
             real(atan(*slope))
         )),
         Surface::Sphere { radius, .. } => {
-            w.add(format!("SPHERICAL_SURFACE('',#{a},{})", real(*radius)))
+            w.addf(format_args!("SPHERICAL_SURFACE('',#{a},{})", real(*radius)))
         }
         // A spindle torus's outer part (the apple): ISO 10303-42's
         // subtype for a major radius under the minor one, whose
@@ -327,7 +411,7 @@ fn surface_entity(w: &mut W, f: &Face) -> usize {
             major_radius,
             minor_radius,
             ..
-        } if major_radius < minor_radius => w.add(format!(
+        } if major_radius < minor_radius => w.addf(format_args!(
             "DEGENERATE_TOROIDAL_SURFACE('',#{a},{},{},.T.)",
             real(*major_radius),
             real(*minor_radius)
@@ -336,12 +420,12 @@ fn surface_entity(w: &mut W, f: &Face) -> usize {
             major_radius,
             minor_radius,
             ..
-        } => w.add(format!(
+        } => w.addf(format_args!(
             "TOROIDAL_SURFACE('',#{a},{},{})",
             real(*major_radius),
             real(*minor_radius)
         )),
-        _ => w.add(format!("PLANE('',#{a})")),
+        _ => w.addf(format_args!("PLANE('',#{a})")),
     }
 }
 
@@ -393,31 +477,34 @@ fn void_parents(b: &Brep) -> Vec<Option<usize>> {
 /// millimetres, with parameter-space curves on curved faces and seam
 /// curves on periodic ones.
 pub fn write_step(brep: &Brep, opts: &StepOptions) -> String {
-    let mut w = W {
-        out: Vec::new(),
-        scratch: String::new(),
-    };
+    let mut w = W::new();
+    // About what a model of straight edges and planar faces takes (a
+    // little over), so the buffer is not copied as it doubles.
+    w.body
+        .reserve(560 * brep.edges.len() + 320 * brep.faces.len() + 96 * brep.vertices.len());
     let name = string(&opts.product_name);
     let app = w.add("APPLICATION_CONTEXT('automotive design')".into());
-    w.add(format!(
+    w.addf(format_args!(
         "APPLICATION_PROTOCOL_DEFINITION('international standard','automotive_design',2000,#{app})"
     ));
-    let pc = w.add(format!("PRODUCT_CONTEXT('',#{app},'mechanical')"));
-    let prod = w.add(format!("PRODUCT({name},{name},'',(#{pc}))"));
-    let pdf = w.add(format!("PRODUCT_DEFINITION_FORMATION('','',#{prod})"));
-    let pdc = w.add(format!(
+    let pc = w.addf(format_args!("PRODUCT_CONTEXT('',#{app},'mechanical')"));
+    let prod = w.addf(format_args!("PRODUCT({name},{name},'',(#{pc}))"));
+    let pdf = w.addf(format_args!("PRODUCT_DEFINITION_FORMATION('','',#{prod})"));
+    let pdc = w.addf(format_args!(
         "PRODUCT_DEFINITION_CONTEXT('part definition',#{app},'design')"
     ));
-    let pd = w.add(format!("PRODUCT_DEFINITION('design','',#{pdf},#{pdc})"));
-    let pds = w.add(format!("PRODUCT_DEFINITION_SHAPE('','',#{pd})"));
+    let pd = w.addf(format_args!(
+        "PRODUCT_DEFINITION('design','',#{pdf},#{pdc})"
+    ));
+    let pds = w.addf(format_args!("PRODUCT_DEFINITION_SHAPE('','',#{pd})"));
     let sdr = w.reserve();
     let lu = w.add("(LENGTH_UNIT()NAMED_UNIT(*)SI_UNIT(.MILLI.,.METRE.))".into());
     let au = w.add("(NAMED_UNIT(*)PLANE_ANGLE_UNIT()SI_UNIT($,.RADIAN.))".into());
     let su = w.add("(NAMED_UNIT(*)SI_UNIT($,.STERADIAN.)SOLID_ANGLE_UNIT())".into());
-    let unc = w.add(format!(
+    let unc = w.addf(format_args!(
         "UNCERTAINTY_MEASURE_WITH_UNIT(LENGTH_MEASURE(1.E-07),#{lu},'distance_accuracy_value','confusion accuracy')"
     ));
-    let ctx = w.add(format!(
+    let ctx = w.addf(format_args!(
         "(GEOMETRIC_REPRESENTATION_CONTEXT(3)GLOBAL_UNCERTAINTY_ASSIGNED_CONTEXT((#{unc}))GLOBAL_UNIT_ASSIGNED_CONTEXT((#{lu},#{au},#{su}))REPRESENTATION_CONTEXT('Context3D','3D'))"
     ));
     let ctx2 = w.add(
@@ -436,7 +523,7 @@ pub fn write_step(brep: &Brep, opts: &StepOptions) -> String {
         .iter()
         .map(|&p| {
             let q = w.pt(p);
-            w.add(format!("VERTEX_POINT('',#{q})"))
+            w.addf(format_args!("VERTEX_POINT('',#{q})"))
         })
         .collect();
     // Each edge's parameter-space curves, in face order.
@@ -463,8 +550,10 @@ pub fn write_step(brep: &Brep, opts: &StepOptions) -> String {
                     .iter()
                     .map(|&(fi, pc)| {
                         let b = bspline_entity(&mut w, pc);
-                        let dr = w.add(format!("DEFINITIONAL_REPRESENTATION('',(#{b}),#{ctx2})"));
-                        w.add(format!("PCURVE('',#{},#{dr})", sids[fi]))
+                        let dr = w.addf(format_args!(
+                            "DEFINITIONAL_REPRESENTATION('',(#{b}),#{ctx2})"
+                        ));
+                        w.addf(format_args!("PCURVE('',#{},#{dr})", sids[fi]))
                     })
                     .collect();
                 let kind = if e.seam {
@@ -472,9 +561,9 @@ pub fn write_step(brep: &Brep, opts: &StepOptions) -> String {
                 } else {
                     "SURFACE_CURVE"
                 };
-                w.add(format!("{kind}('',#{c3},({}),.PCURVE_S1.)", refs(&ps)))
+                w.addf(format_args!("{kind}('',#{c3},({}),.PCURVE_S1.)", Refs(&ps)))
             };
-            w.add(format!(
+            w.addf(format_args!(
                 "EDGE_CURVE('',#{},#{},#{geom},.T.)",
                 vids[e.start as usize], vids[e.end as usize]
             ))
@@ -491,28 +580,28 @@ pub fn write_step(brep: &Brep, opts: &StepOptions) -> String {
                     .coedges
                     .iter()
                     .map(|c| {
-                        w.add(format!(
+                        w.addf(format_args!(
                             "ORIENTED_EDGE('',*,*,#{},{})",
                             eids[c.edge as usize],
                             if c.forward { ".T." } else { ".F." }
                         ))
                     })
                     .collect();
-                let l = w.add(format!("EDGE_LOOP('',({}))", refs(&oes)));
+                let l = w.addf(format_args!("EDGE_LOOP('',({}))", Refs(&oes)));
                 let kind = if lp.outer {
                     "FACE_OUTER_BOUND"
                 } else {
                     "FACE_BOUND"
                 };
-                w.add(format!(
+                w.addf(format_args!(
                     "{kind}('',#{l},{})",
                     if flip { ".F." } else { ".T." }
                 ))
             })
             .collect();
-        w.add(format!(
+        w.addf(format_args!(
             "ADVANCED_FACE('',({}),#{},{})",
-            refs(&bounds),
+            Refs(&bounds),
             sids[fi],
             if f.same_sense != flip { ".T." } else { ".F." }
         ))
@@ -524,7 +613,7 @@ pub fn write_step(brep: &Brep, opts: &StepOptions) -> String {
             .iter()
             .map(|&f| face_entity(&mut w, f as usize, sh.void))
             .collect();
-        shell_ids.push(w.add(format!("CLOSED_SHELL('',({}))", refs(&fs))));
+        shell_ids.push(w.addf(format_args!("CLOSED_SHELL('',({}))", Refs(&fs))));
     }
     let mut solids = Vec::new();
     for (i, sh) in brep.shells.iter().enumerate() {
@@ -533,30 +622,36 @@ pub fn write_step(brep: &Brep, opts: &StepOptions) -> String {
         }
         let voids: Vec<usize> = (0..brep.shells.len())
             .filter(|&j| parents[j] == Some(i))
-            .map(|j| w.add(format!("ORIENTED_CLOSED_SHELL('',*,#{},.F.)", shell_ids[j])))
+            .map(|j| {
+                w.addf(format_args!(
+                    "ORIENTED_CLOSED_SHELL('',*,#{},.F.)",
+                    shell_ids[j]
+                ))
+            })
             .collect();
         solids.push(if voids.is_empty() {
-            w.add(format!("MANIFOLD_SOLID_BREP('',#{})", shell_ids[i]))
+            w.addf(format_args!("MANIFOLD_SOLID_BREP('',#{})", shell_ids[i]))
         } else {
-            w.add(format!(
+            w.addf(format_args!(
                 "BREP_WITH_VOIDS('',#{},({}))",
                 shell_ids[i],
-                refs(&voids)
+                Refs(&voids)
             ))
         });
     }
     let mut items = solids;
     items.push(origin);
-    let rep = w.add(format!(
+    let rep = w.addf(format_args!(
         "ADVANCED_BREP_SHAPE_REPRESENTATION('',({}),#{ctx})",
-        refs(&items)
+        Refs(&items)
     ));
     w.set(
         sdr,
         format!("SHAPE_DEFINITION_REPRESENTATION(#{pds},#{rep})"),
     );
 
-    let mut s = String::with_capacity(w.out.iter().map(|l| l.len() + 10).sum::<usize>() + 1024);
+    let data: usize = w.body.len() + w.holes.iter().map(|h| h.2.len() + 24).sum::<usize>();
+    let mut s = String::with_capacity(data + 1024);
     s.push_str("ISO-10303-21;\nHEADER;\n");
     let _ = writeln!(
         s,
@@ -574,16 +669,7 @@ pub fn write_step(brep: &Brep, opts: &StepOptions) -> String {
         string(&opts.originating_system)
     );
     s.push_str("FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }'));\nENDSEC;\nDATA;\n");
-    let mut num = String::new();
-    for (i, l) in w.out.iter().enumerate() {
-        num.clear();
-        let _ = write!(num, "{}", i + 1);
-        s.push('#');
-        s.push_str(&num);
-        s.push('=');
-        s.push_str(l);
-        s.push_str(";\n");
-    }
+    w.into_data(&mut s);
     s.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
     s
 }

@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+Faster on large and faceted models; the same B-rep and the same STEP
+bytes for every input.
+
+- `Report::faces_uncrossed`: set by reconstruction, which checks every
+  face's boundary for crossing itself; `validate` then does not check
+  again (that check has no tolerance, so the answer is the same). Clear
+  it after editing a B-rep's vertices, edges or loops. Breaking for a
+  caller that builds `Report` with a struct literal (use
+  `..Default::default()`).
+- Seam placement no longer scans every edge for each candidate meridian
+  of each face, nor rebuilds every loop of the model for each edge it
+  splits, and solves a crossing's curve parameter only for meridians it
+  can use (quadratic before: the BOSL2 fractal tree's 2,000 cylinders
+  spent seconds there).
+- Small planar faces of straight edges (faceted regions, `$fn`
+  polygons) are checked for crossing or touching themselves without the
+  general search's allocations and sorts, answering as it does.
+- The STEP writer appends each entity to one buffer as it goes, rather
+  than keeping a string per entity and joining them (a third less time
+  writing a 100 MB file).
+- Fewer allocations elsewhere: half-edge pairing by a counting sort,
+  vertex lookup by index, in-place Gauss–Newton steps, planar loop
+  areas without sample vectors.
+
 ## 0.3.0
 
 Blends between curved surfaces, exact B-spline surfaces and spindle

@@ -365,9 +365,13 @@ fn validate_unsorted(brep: &Brep, tolerance: f64) -> Validation {
     // Geometry.
     for (i, e) in brep.edges.iter().enumerate() {
         if e.start != e.end {
-            let len: f64 = curve::sample(&e.curve, e.range, 8)
-                .windows(2)
-                .map(|w| (w[1] - w[0]).len())
+            let mut prev: Option<V> = None;
+            let len: f64 = curve::samples(&e.curve, e.range, 8)
+                .filter_map(|q| {
+                    let step = prev.map(|p| (q - p).len());
+                    prev = Some(q);
+                    step
+                })
                 .sum();
             if len < tolerance {
                 err(
@@ -407,9 +411,8 @@ fn validate_unsorted(brep: &Brep, tolerance: f64) -> Validation {
             for c in &lp.coedges {
                 let e = &brep.edges[c.edge as usize];
                 let n = curve::sample_count(&e.curve, e.range).min(256);
-                let worst = curve::sample(&e.curve, e.range, n)
-                    .iter()
-                    .map(|&q| p.s.f(q).abs())
+                let worst = curve::samples(&e.curve, e.range, n)
+                    .map(|q| p.s.f(q).abs())
                     .fold(0.0, f64::max);
                 if worst > tolerance {
                     err(
@@ -552,8 +555,17 @@ fn validate_unsorted(brep: &Brep, tolerance: f64) -> Validation {
         }
     }
     if out.errors.is_empty() {
+        // Reconstruction made the crossing check already; the touch check
+        // is made again, since `tolerance` is the caller's and may be
+        // larger than reconstruction's.
+        let crossed = !brep.report.faces_uncrossed;
         for fi in 0..nf {
-            if let Some(e) = face_crossing(brep, fi).or_else(|| face_touch(brep, fi, tolerance)) {
+            let crossing = if crossed {
+                face_crossing(brep, fi)
+            } else {
+                None
+            };
+            if let Some(e) = crossing.or_else(|| face_touch(brep, fi, tolerance)) {
                 err(&mut out, e, at_face(fi));
             }
         }
@@ -702,8 +714,118 @@ pub(crate) fn face_crossing(b: &Brep, fi: usize) -> Option<String> {
             )
         })
     };
+    if !small_face_may_cross(b, fi) {
+        return None;
+    }
     found(1)?;
     found(8)
+}
+
+/// Whether [`face_crossing`] can find a crossing on face `fi`: `false`
+/// only for a planar face of a few straight edges whose boundary does not
+/// cross itself by `crossing_in`'s own test (the same points, tolerance
+/// and pairs of segments), made with no allocation. On a faceted model
+/// of hundreds of thousands of such faces, building the general test's
+/// polylines and sorting their segments was a fifth of reconstruction.
+/// A crossing found, or any other face, is `true`: the general test then
+/// decides, and says where.
+fn small_face_may_cross(b: &Brep, fi: usize) -> bool {
+    const SMALL: usize = 16;
+    let f = &b.faces[fi];
+    let Some(p) = face_param(f) else {
+        return true;
+    };
+    let coedges = || f.loops.iter().flat_map(|l| &l.coedges);
+    if p.has_pcurves()
+        || f.loops.len() > SMALL
+        || coedges().count() > SMALL
+        || coedges().any(|c| {
+            !matches!(
+                b.edges[c.edge as usize].curve,
+                crate::model::Curve::Line { .. }
+            )
+        })
+    {
+        return true;
+    }
+    // `face_polylines(.., 1)`: per coedge on a line, its two ends in plane
+    // coordinates in loop order, the first dropped after the loop's
+    // first coedge. Segments are (start, end, loop, index in loop).
+    let mut segs = [([0.0f64; 2], [0.0f64; 2], 0usize, 0usize); 2 * SMALL];
+    let mut ns = 0;
+    let mut lens = [0usize; SMALL];
+    let (mut lo, mut hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+    for (li, lp) in f.loops.iter().enumerate() {
+        let mut pts = [[0.0f64; 2]; SMALL + 1];
+        let mut n = 0;
+        for c in &lp.coedges {
+            let e = &b.edges[c.edge as usize];
+            // `curve::sample(.., 1)`'s parameters, to the bit.
+            let t = |i: usize| e.range[0] + (e.range[1] - e.range[0]) * i as f64 / 1.0;
+            let mut s = [t(0), t(1)].map(|t| {
+                let d = curve::eval(&e.curve, t) - p.o;
+                [d.dot(p.x), d.dot(p.y)]
+            });
+            if !c.forward {
+                s.reverse();
+            }
+            let from = usize::from(n > 0);
+            for q in &s[from..] {
+                pts[n] = *q;
+                n += 1;
+            }
+        }
+        lens[li] = n;
+        for i in 0..n {
+            let (a, c) = (pts[i], pts[(i + 1) % n]);
+            for d in 0..2 {
+                lo[d] = lo[d].min(a[d]);
+                hi[d] = hi[d].max(a[d]);
+            }
+            segs[ns] = (a, c, li, i);
+            ns += 1;
+        }
+    }
+    let segs = &segs[..ns];
+    let ext = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1e-300);
+    let eps = 1e-9 * ext;
+    let orient = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    };
+    let minx = |s: &([f64; 2], [f64; 2], usize, usize)| s.0[0].min(s.1[0]);
+    for (i, si) in segs.iter().enumerate() {
+        for sj in &segs[i + 1..] {
+            // `crossing_in` sorts by the smaller x and stops at the first
+            // segment starting past the earlier one's end: the pairs it
+            // compares, in either order.
+            let (first, second) = if minx(sj) < minx(si) {
+                (sj, si)
+            } else {
+                (si, sj)
+            };
+            if minx(second) > first.0[0].max(first.1[0]) + eps {
+                continue;
+            }
+            let ((p1, p2, li, ii), (q1, q2, lj, jj)) = (*si, *sj);
+            if li == lj {
+                let n = lens[li];
+                if (ii + 1) % n == jj || (jj + 1) % n == ii || ii == jj {
+                    continue;
+                }
+            }
+            let lp = ((p2[0] - p1[0]).powi(2) + (p2[1] - p1[1]).powi(2)).sqrt();
+            let lq = ((q2[0] - q1[0]).powi(2) + (q2[1] - q1[1]).powi(2)).sqrt();
+            let (o1, o2) = (orient(p1, p2, q1), orient(p1, p2, q2));
+            let (o3, o4) = (orient(q1, q2, p1), orient(q1, q2, p2));
+            let (ep, eq) = (eps * lp, eps * lq);
+            if ((o1 > ep && o2 < -ep) || (o1 < -ep && o2 > ep))
+                && ((o3 > eq && o4 < -eq) || (o3 < -eq && o4 > eq))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Where a corner of a face lies inside another edge of the same face,
@@ -721,6 +843,14 @@ pub(crate) fn face_crossing(b: &Brep, fi: usize) -> Option<String> {
 /// edges because of this. The test is in space, not in the parameter
 /// plane, whose `u` (an angle) and `v` (a length) are not comparable.
 pub(crate) fn face_touch(b: &Brep, fi: usize, tol: f64) -> Option<String> {
+    if !small_face_touches(b, &b.faces[fi], tol) {
+        return None;
+    }
+    face_touch_search(b, fi, tol)
+}
+
+/// [`face_touch`]'s search on any face.
+fn face_touch_search(b: &Brep, fi: usize, tol: f64) -> Option<String> {
     let f = &b.faces[fi];
     // (vertex, loop) and (edge, loop) pairs.
     let mut verts: Vec<(u32, usize)> = Vec::new();
@@ -745,13 +875,23 @@ pub(crate) fn face_touch(b: &Brep, fi: usize, tol: f64) -> Option<String> {
     // its box: faces of thousands of corners are common (text, `$fn`).
     let mut by_x: Vec<(f64, u32, usize)> = verts.iter().map(|&(v, l)| (at(v).x, v, l)).collect();
     by_x.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+    // One buffer of samples for all the face's edges (faceted faces are
+    // a few lines each, and there are hundreds of thousands of them).
+    let mut pts: Vec<V> = Vec::new();
     for &(ei, el) in &edges {
         let e = &b.edges[ei as usize];
         let n = curve::sample_count(&e.curve, e.range);
-        let pts = curve::sample(&e.curve, e.range, n);
+        pts.clear();
+        pts.extend((0..=n).map(|i| {
+            curve::eval(
+                &e.curve,
+                e.range[0] + (e.range[1] - e.range[0]) * i as f64 / n as f64,
+            )
+        }));
+        let pts = &pts[..];
         let mut lo = pts[0];
         let mut hi = pts[0];
-        for p in &pts {
+        for p in pts {
             lo = v(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
             hi = v(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
         }
@@ -778,7 +918,7 @@ pub(crate) fn face_touch(b: &Brep, fi: usize, tol: f64) -> Option<String> {
             {
                 continue;
             }
-            if distance_to_curve(&e.curve, e.range, &pts, p) <= tol {
+            if distance_to_curve(&e.curve, e.range, pts, p) <= tol {
                 return Some(format!(
                     "face {fi}: boundary touches itself, a corner at ({:.4}, {:.4}, {:.4}) lies on edge {ei} ({})",
                     p.x,
@@ -794,6 +934,89 @@ pub(crate) fn face_touch(b: &Brep, fi: usize, tol: f64) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether [`face_touch`] can find anything on `f`: `false` only for a
+/// face of a few straight edges where no corner lies on another edge, by
+/// [`face_touch`]'s own test (the same samples, boxes and distances),
+/// made with no sorting and no allocation. Faceted and polygonal models
+/// are hundreds of thousands of such faces, and setting up the general
+/// search (corner and edge lists, sorted, deduplicated) took most of the
+/// check's time on them. Any other face, or a touch found, is `true`:
+/// the general search then decides, and names what it finds as before.
+fn small_face_touches(b: &Brep, f: &crate::model::Face, tol: f64) -> bool {
+    const SMALL: usize = 16;
+    let n_coedges: usize = f.loops.iter().map(|l| l.coedges.len()).sum();
+    if n_coedges > SMALL
+        || f.loops.iter().flat_map(|l| &l.coedges).any(|c| {
+            !matches!(
+                b.edges[c.edge as usize].curve,
+                crate::model::Curve::Line { .. }
+            )
+        })
+    {
+        return true;
+    }
+    let at = |v: u32| V::from(b.vertices[v as usize]);
+    // Every corner, with repeats (a repeat finds what the first finds).
+    let corners = || {
+        f.loops.iter().flat_map(|l| &l.coedges).flat_map(|c| {
+            let e = &b.edges[c.edge as usize];
+            [e.start, e.end]
+        })
+    };
+    let mut distinct = [u32::MAX; 2 * SMALL];
+    let mut nd = 0;
+    for v in corners() {
+        if !distinct[..nd].contains(&v) {
+            distinct[nd] = v;
+            nd += 1;
+        }
+    }
+    if nd < 3 {
+        return false;
+    }
+    for c in f.loops.iter().flat_map(|l| &l.coedges) {
+        let e = &b.edges[c.edge as usize];
+        // `sample_count` of a line.
+        const N: usize = 4;
+        let pts: [V; N + 1] = std::array::from_fn(|i| {
+            curve::eval(
+                &e.curve,
+                e.range[0] + (e.range[1] - e.range[0]) * i as f64 / N as f64,
+            )
+        });
+        let mut lo = pts[0];
+        let mut hi = pts[0];
+        for p in &pts {
+            lo = v(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+            hi = v(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+        }
+        let pad = tol + 0.05 * (hi - lo).len() / N as f64;
+        let (s, t) = (at(e.start), at(e.end));
+        for &vi in &distinct[..nd] {
+            if vi == e.start || vi == e.end {
+                continue;
+            }
+            let p = at(vi);
+            // `face_touch`'s window in x, then its box and its ends.
+            if p.x < lo.x - pad
+                || p.x > hi.x + pad
+                || p.y < lo.y - pad
+                || p.z < lo.z - pad
+                || p.y > hi.y + pad
+                || p.z > hi.z + pad
+                || (p - s).len() <= tol
+                || (p - t).len() <= tol
+            {
+                continue;
+            }
+            if distance_to_curve(&e.curve, e.range, &pts, p) <= tol {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// The distance from `p` to a curve sampled as `pts` over `range`: from
@@ -840,7 +1063,17 @@ fn crossing_in(lines: &[Vec<[f64; 2]>]) -> Option<([f64; 2], [f64; 2])> {
     let ext = (hi[0] - lo[0]).max(hi[1] - lo[1]).max(1e-300);
     let eps = 1e-9 * ext;
     let len_of = |li: usize| lines[li].len();
-    segs.sort_by(|a, b| a.0[0].min(a.1[0]).total_cmp(&b.0[0].min(b.1[0])));
+    // A stable sort by the smaller x, made as an unstable one by that x
+    // and then the position (the same order), with the key computed once:
+    // curved faces have thousands of segments, and sorting them was a
+    // third of this check.
+    let mut order: Vec<(f64, u32)> = segs
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.0[0].min(s.1[0]), i as u32))
+        .collect();
+    order.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    let segs: Vec<_> = order.iter().map(|&(_, i)| segs[i as usize]).collect();
     let orient = |a: [f64; 2], b: [f64; 2], c: [f64; 2]| {
         (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
     };
@@ -870,4 +1103,178 @@ fn crossing_in(lines: &[Vec<[f64; 2]>]) -> Option<([f64; 2], [f64; 2])> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{Coedge, Curve, Edge, Face, Frame, Loop, Surface};
+
+    /// One planar face on z = 0 bounded by `loops` (each a polygon of
+    /// points, a vertex of its own per point, so a repeated point is two
+    /// vertices at one position, as Manifold keeps touching bodies apart),
+    /// with straight edges.
+    fn polygon_face(loops: &[Vec<[f64; 2]>]) -> Brep {
+        let mut b = Brep::default();
+        let mut face_loops = Vec::new();
+        for (li, pts) in loops.iter().enumerate() {
+            let first = b.vertices.len() as u32;
+            b.vertices.extend(pts.iter().map(|p| [p[0], p[1], 0.0]));
+            let mut coedges = Vec::new();
+            for k in 0..pts.len() {
+                let (s, e) = (first + k as u32, first + ((k + 1) % pts.len()) as u32);
+                let (p, q) = (b.vertices[s as usize], b.vertices[e as usize]);
+                let d = [q[0] - p[0], q[1] - p[1], 0.0];
+                let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
+                coedges.push(Coedge {
+                    edge: b.edges.len() as u32,
+                    forward: true,
+                    pcurve: None,
+                });
+                b.edges.push(Edge {
+                    start: s,
+                    end: e,
+                    curve: Curve::Line {
+                        origin: p,
+                        direction: [d[0] / l, d[1] / l, 0.0],
+                    },
+                    range: [0.0, l],
+                    seam: false,
+                });
+            }
+            face_loops.push(Loop {
+                coedges,
+                outer: li == 0,
+            });
+        }
+        b.faces.push(Face {
+            surface: Surface::Plane {
+                origin: [0.0; 3],
+                normal: [0.0, 0.0, 1.0],
+            },
+            frame: Frame {
+                origin: [0.0; 3],
+                z: [0.0, 0.0, 1.0],
+                x: [1.0, 0.0, 0.0],
+            },
+            ref_radius: 0.0,
+            same_sense: true,
+            loops: face_loops,
+            faceted: true,
+        });
+        b
+    }
+
+    /// Polygons of 4 and 5 corners on a 3 × 3 grid, sheared a little so
+    /// that not every edge is axis-aligned: bow ties, corners on other
+    /// edges, repeated points, plain quads.
+    fn polygons() -> Vec<Vec<[f64; 2]>> {
+        let grid: Vec<[f64; 2]> = (0..9)
+            .map(|i| {
+                let (x, y) = ((i % 3) as f64, (i / 3) as f64);
+                [x + 0.125 * y, y]
+            })
+            .collect();
+        let mut out = Vec::new();
+        for a in 0..9 {
+            for b in 0..9 {
+                for c in 0..9 {
+                    for d in 0..9 {
+                        if a == b || b == c || c == d || d == a {
+                            continue;
+                        }
+                        out.push(vec![grid[a], grid[b], grid[c], grid[d]]);
+                        let e = (a + b + c + d) % 9;
+                        if e != d && e != a {
+                            out.push(vec![grid[a], grid[b], grid[c], grid[d], grid[e]]);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The quick tests in front of the crossing and touch searches answer
+    /// as the searches do on the small straight-edged faces they take: a
+    /// quick "no" is never a missed crossing or touch, and a "yes" is one
+    /// the search finds (and names).
+    #[test]
+    fn the_quick_face_checks_agree_with_the_searches() {
+        let hole = vec![[0.75, 0.75], [1.25, 0.75], [1.0, 1.25]];
+        let (mut crossings, mut touches, mut faces) = (0, 0, 0);
+        for (i, outer) in polygons().into_iter().enumerate() {
+            let mut loops = vec![outer];
+            if i % 7 == 0 {
+                loops.push(hole.clone());
+            }
+            let b = polygon_face(&loops);
+            faces += 1;
+            let search = face_polylines(&b, 0, 1).and_then(|l| crossing_in(&l));
+            assert_eq!(
+                small_face_may_cross(&b, 0),
+                search.is_some(),
+                "crossing on {loops:?}"
+            );
+            crossings += usize::from(search.is_some());
+            for tol in [1e-6, 0.05] {
+                let search = face_touch_search(&b, 0, tol);
+                assert_eq!(
+                    small_face_touches(&b, &b.faces[0], tol),
+                    search.is_some(),
+                    "touch at {tol} on {loops:?}"
+                );
+                touches += usize::from(search.is_some());
+            }
+        }
+        // Both answers, many times each.
+        assert!(
+            crossings > faces / 10 && crossings < faces - faces / 10,
+            "{crossings} of {faces}"
+        );
+        assert!(touches > faces / 10, "{touches} of {faces}");
+    }
+
+    /// `validate` makes the crossing check unless the B-rep says that
+    /// reconstruction made it: a bow tie is found, and not looked for on a
+    /// B-rep whose report vouches for it.
+    #[test]
+    fn the_crossing_check_is_skipped_only_when_reconstruction_made_it() {
+        // A pentagon one of whose edges crosses another, and the same
+        // face reversed: every edge used twice, in opposite directions,
+        // one shell of genus 0, so the crossing check is reached.
+        let mut b = polygon_face(&[vec![
+            [0.0, 0.0],
+            [4.0, 0.0],
+            [4.0, 3.0],
+            [1.0, -1.0],
+            [0.0, 3.0],
+        ]]);
+        let mut back = b.faces[0].clone();
+        for l in &mut back.loops {
+            l.coedges.reverse();
+            for c in &mut l.coedges {
+                c.forward = !c.forward;
+            }
+        }
+        b.faces.push(back);
+        b.shells.push(crate::model::Shell {
+            faces: vec![0, 1],
+            void: false,
+        });
+        let errors = |b: &Brep| validate(b, 1e-6).errors;
+        let found = errors(&b);
+        assert!(
+            found.iter().all(|e| e.contains("crosses itself")) && found.len() == 2,
+            "{found:?}"
+        );
+        // Vouched for, it is not looked for (the next check, of the
+        // shells' volumes, then finds the faces enclose none).
+        b.report.faces_uncrossed = true;
+        let found = errors(&b);
+        assert!(
+            found.iter().all(|e| !e.contains("crosses itself")) && !found.is_empty(),
+            "{found:?}"
+        );
+    }
 }

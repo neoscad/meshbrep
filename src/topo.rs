@@ -132,27 +132,57 @@ impl Topo {
         self.edges[e].v1 = nv;
         self.edges[e].range[1] = t;
         let ne = self.edges.len();
+        let near = self.edges[e].faces;
         self.edges.push(second);
-        for f in &mut self.faces {
-            for lp in &mut f.loops {
-                let mut out = Vec::with_capacity(lp.len() + 1);
-                for &(x, fwd) in lp.iter() {
-                    if x == e {
-                        if fwd {
-                            out.push((e, true));
-                            out.push((ne, true));
-                        } else {
-                            out.push((ne, false));
-                            out.push((e, false));
-                        }
-                    } else {
-                        out.push((x, fwd));
-                    }
+        // The faces the edge names first: it is used once on each side,
+        // so finding both uses there is the usual case, and rebuilding
+        // every loop of the model for each split made seam placement
+        // quadratic (thousands of seams on the BOSL2 fractal tree). Any
+        // other count, or names out of date, and every loop is searched.
+        let mut found = 0;
+        let mut seen = [usize::MAX; 2];
+        for (k, f) in near.into_iter().enumerate() {
+            if f < self.faces.len() && !seen.contains(&f) {
+                seen[k] = f;
+                found += Self::split_uses(&mut self.faces[f], e, ne);
+            }
+        }
+        if found != 2 {
+            for (fi, f) in self.faces.iter_mut().enumerate() {
+                if !seen.contains(&fi) {
+                    Self::split_uses(f, e, ne);
                 }
-                *lp = out;
             }
         }
         nv
+    }
+
+    /// Replaces each use of edge `e` in `f`'s loops by `e` then `ne` (in
+    /// the use's direction). Returns how many uses there were.
+    fn split_uses(f: &mut TFace, e: usize, ne: usize) -> usize {
+        let mut n = 0;
+        for lp in &mut f.loops {
+            if !lp.iter().any(|&(x, _)| x == e) {
+                continue;
+            }
+            let mut out = Vec::with_capacity(lp.len() + 1);
+            for &(x, fwd) in lp.iter() {
+                if x == e {
+                    n += 1;
+                    if fwd {
+                        out.push((e, true));
+                        out.push((ne, true));
+                    } else {
+                        out.push((ne, false));
+                        out.push((e, false));
+                    }
+                } else {
+                    out.push((x, fwd));
+                }
+            }
+            *lp = out;
+        }
+        n
     }
 
     /// Collapses open edges shorter than `tol`, joining their two vertices.

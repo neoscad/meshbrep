@@ -252,6 +252,8 @@ fn reconstruct_with(mesh: &TaggedMesh, options: &Options, contacts: bool) -> Res
         })
         .collect();
     b.report.scale = built.scale;
+    // Every face passed `face_crossing` above.
+    b.report.faces_uncrossed = true;
     b.report.mesh_genus = built.mesh_genus;
     b.report.mesh_components = built.mesh_components;
     b.report.max_vertex_residual = built.max_vertex_residual;
@@ -469,6 +471,9 @@ mod tests {
     fn a_closed_edge_inside_a_longer_loop_is_an_error() {
         let mesh = primitives::frustum(10.0, 5.0, 5.0, 32, &Transform::IDENTITY);
         let mut b = reconstruct(&mesh, &Options::default()).unwrap();
+        // Reconstruction checked every face for crossings, which
+        // `validate` then leaves out.
+        assert!(b.report.faces_uncrossed);
         assert!(validate(&b, 1e-6).is_valid());
         let f = b
             .faces

@@ -145,6 +145,39 @@ fn area(l: &[Vec<S>]) -> f64 {
     s
 }
 
+/// Twice the signed area of a loop on a planar face: `area(&lift_loop(..))`
+/// to the bit (the same samples, summed in the same order), without the
+/// vectors of samples. A large faceted model has a million coedges, every
+/// one on a plane, and allocating their samples to find which loop is a
+/// face's outer one took a tenth of its reconstruction.
+fn planar_loop_area(topo: &Topo, param: &Param, lp: &[(usize, bool)]) -> f64 {
+    let mut s = 0.0;
+    for &(e, fwd) in lp {
+        let ed = &topo.edges[e];
+        let n = curve::sample_count(&ed.curve, ed.range);
+        let [t0, t1] = ed.range;
+        // Sample `i` of the edge, as `coedge_points` places it.
+        let at = |i: usize| {
+            let p = if i == 0 {
+                topo.verts[ed.v0]
+            } else if i == n {
+                topo.verts[ed.v1]
+            } else {
+                curve::eval(&ed.curve, t0 + (t1 - t0) * i as f64 / n as f64)
+            };
+            param.uv(p)
+        };
+        let in_loop = |k: usize| if fwd { k } else { n - k };
+        let mut prev = at(in_loop(0));
+        for k in 1..=n {
+            let cur = at(in_loop(k));
+            s += prev.0 * cur.1 - cur.0 * prev.1;
+            prev = cur;
+        }
+    }
+    s
+}
+
 /// Where a loop crosses the meridian `u ≡ u0`.
 #[derive(Clone, Copy, Debug)]
 struct Crossing {
@@ -156,66 +189,102 @@ struct Crossing {
     at_start: bool,
 }
 
-fn crossings(
-    topo: &Topo,
-    param: &Param,
-    lp: &[(usize, bool)],
-    l: &[Vec<S>],
-    u0: f64,
-) -> Vec<Crossing> {
-    const EPS: f64 = 1e-11;
-    let g = |u: f64| {
-        let d = u - u0;
-        d - TAU * (d / TAU).round()
-    };
+/// Where a loop crosses the meridian `u ≡ u0`, before the crossing's
+/// curve parameter is solved for: the coedge, the sample the crossing
+/// follows, and whether that sample is on the meridian itself.
+#[derive(Clone, Copy, Debug)]
+struct Site {
+    ci: usize,
+    i: usize,
+    on: bool,
+}
+
+/// How close to the meridian a sample is on it.
+const MERIDIAN_EPS: f64 = 1e-11;
+
+/// A sample's signed offset from the meridian `u0`, in (-π, π].
+fn sheet(u: f64, u0: f64) -> f64 {
+    let d = u - u0;
+    d - TAU * (d / TAU).round()
+}
+
+/// Where the lifted loop `l` crosses the meridian `u0`. Finding them
+/// costs a pass over the samples; solving each for its curve parameter
+/// ([`crossing_at`]) costs a bisection on the curve, which the search for
+/// a seam needs only for the meridians it can use.
+fn crossing_sites(l: &[Vec<S>], u0: f64) -> Vec<Site> {
     let mut out = Vec::new();
     for (ci, c) in l.iter().enumerate() {
         for i in 0..c.len() - 1 {
             let (a, b) = (c[i], c[i + 1]);
             // Signed offsets in one sheet: continue a's sheet to b.
-            let ga = g(a.u);
+            let ga = sheet(a.u, u0);
             let gb = ga + (b.u - a.u);
-            if ga.abs() < EPS {
-                out.push(Crossing {
-                    ci,
-                    t: a.t,
-                    at_start: i == 0,
-                });
+            if ga.abs() < MERIDIAN_EPS {
+                out.push(Site { ci, i, on: true });
                 continue;
             }
             // Between samples u moves by less than π, so b lies in the
             // same sheet as a, and a crossing is a change of sign. A
             // crossing at b itself is counted as the next segment's start.
-            if gb.abs() < EPS || (ga < 0.0) == (gb < 0.0) {
+            if gb.abs() < MERIDIAN_EPS || (ga < 0.0) == (gb < 0.0) {
                 continue;
             }
-            // Bisection on the curve parameter.
-            let ed = &topo.edges[lp[ci].0];
-            let ev = CurveEval::new(&ed.curve);
-            let (mut lo, mut hi) = (a.t, b.t);
-            let f = |t: f64| ga + (wrap_near(param.angle(ev.at(t)), a.u) - a.u);
-            for _ in 0..80 {
-                let mid = 0.5 * (lo + hi);
-                if (f(mid) < 0.0) == (ga < 0.0) {
-                    lo = mid;
-                } else {
-                    hi = mid;
-                }
-            }
-            let t = 0.5 * (lo + hi);
-            out.push(Crossing {
-                ci,
-                t,
-                at_start: false,
-            });
+            out.push(Site { ci, i, on: false });
         }
     }
     out
 }
 
+/// The crossing at `site` of [`crossing_sites`]`(l, u0)`.
+fn crossing_at(
+    topo: &Topo,
+    param: &Param,
+    lp: &[(usize, bool)],
+    l: &[Vec<S>],
+    u0: f64,
+    site: Site,
+) -> Crossing {
+    let Site { ci, i, on } = site;
+    let (a, b) = (l[ci][i], l[ci][i + 1]);
+    if on {
+        return Crossing {
+            ci,
+            t: a.t,
+            at_start: i == 0,
+        };
+    }
+    let ga = sheet(a.u, u0);
+    // Bisection on the curve parameter.
+    let ed = &topo.edges[lp[ci].0];
+    let ev = CurveEval::new(&ed.curve);
+    let (mut lo, mut hi) = (a.t, b.t);
+    let f = |t: f64| ga + (wrap_near(param.angle(ev.at(t)), a.u) - a.u);
+    for _ in 0..80 {
+        let mid = 0.5 * (lo + hi);
+        // Converged: `lo` and `hi` are adjacent numbers, and whichever
+        // way this step went, the midpoint taken at the end would be this
+        // one (the bits are the 80 steps').
+        if mid == lo || mid == hi {
+            break;
+        }
+        if (f(mid) < 0.0) == (ga < 0.0) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let t = 0.5 * (lo + hi);
+    Crossing {
+        ci,
+        t,
+        at_start: false,
+    }
+}
+
 /// A loop that is one closed circle or ellipse whose vertex nothing else
 /// uses: its vertex can move anywhere along it.
-fn movable(topo: &Topo, lp: &[(usize, bool)]) -> bool {
+fn movable(topo: &Topo, deg: &Degrees, lp: &[(usize, bool)]) -> bool {
     if lp.len() != 1 {
         return false;
     }
@@ -223,12 +292,61 @@ fn movable(topo: &Topo, lp: &[(usize, bool)]) -> bool {
     e.closed()
         && !topo.pinned[e.v0]
         && matches!(e.curve, Curve::Circle { .. } | Curve::Ellipse { .. })
-        && topo
-            .edges
-            .iter()
-            .filter(|x| x.v0 == e.v0 || x.v1 == e.v0)
-            .count()
-            == 1
+        && deg.of(e.v0) == 1
+}
+
+/// How many edges touch each vertex (a closed edge once), kept in step
+/// with the topology while seams are added. [`movable`] asks for every
+/// candidate meridian of every wrapping face; counting with a scan of all
+/// edges each time made seam placement quadratic in the model's size (the
+/// BOSL2 fractal tree, 4,000 cylinder faces and 200,000 edges, spent
+/// seconds there).
+struct Degrees {
+    deg: Vec<u32>,
+    /// Edges counted so far: the ones after are new since.
+    seen: usize,
+}
+
+impl Degrees {
+    fn new(topo: &Topo) -> Degrees {
+        let mut d = Degrees {
+            deg: Vec::new(),
+            seen: 0,
+        };
+        d.sync(topo);
+        d
+    }
+
+    /// Counts the edges appended since the last call, as they are now.
+    fn sync(&mut self, topo: &Topo) {
+        self.deg.resize(topo.verts.len(), 0);
+        for e in &topo.edges[self.seen..] {
+            self.deg[e.v0] += 1;
+            if e.v1 != e.v0 {
+                self.deg[e.v1] += 1;
+            }
+        }
+        self.seen = topo.edges.len();
+    }
+
+    fn of(&self, v: usize) -> u32 {
+        self.deg[v]
+    }
+
+    /// [`Topo::split_edge`] with the counts kept: edge `e` now ends at the
+    /// new vertex, and the edge appended runs from it to where `e` ended.
+    fn split_edge(&mut self, topo: &mut Topo, e: usize, t: f64, p: V) -> usize {
+        self.sync(topo);
+        let (v0, v1) = (topo.edges[e].v0, topo.edges[e].v1);
+        let nv = topo.split_edge(e, t, p);
+        self.deg.resize(topo.verts.len(), 0);
+        if v1 != v0 {
+            self.deg[v1] -= 1;
+        }
+        self.deg[nv] += 1;
+        self.sync(topo);
+        nv
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -645,9 +763,10 @@ fn is_double_seam_loop(topo: &Topo, param: &Param, lp: &[(usize, bool)]) -> bool
 fn frames_and_seams(topo: &mut Topo, scale: f64) -> Result<(), Failure> {
     let mut start = 0usize;
     let mut failure: Option<Failure> = None;
+    let mut deg = Degrees::new(topo);
     while start < topo.faces.len() {
         let mut at = start;
-        match frames_and_seams_from(topo, scale, &mut at) {
+        match frames_and_seams_from(topo, scale, &mut at, &mut deg) {
             Ok(()) => break,
             Err(error) => {
                 let tris = &topo.faces[at].source;
@@ -675,10 +794,17 @@ fn frames_and_seams(topo: &mut Topo, scale: f64) -> Result<(), Failure> {
 
 /// [`frames_and_seams`] from face `at` on, keeping in `at` the face it is
 /// working on.
-fn frames_and_seams_from(topo: &mut Topo, scale: f64, at: &mut usize) -> Result<(), Error> {
+fn frames_and_seams_from(
+    topo: &mut Topo,
+    scale: f64,
+    at: &mut usize,
+    deg: &mut Degrees,
+) -> Result<(), Error> {
     let tol = 1e-9 * scale;
     for f in *at..topo.faces.len() {
         *at = f;
+        // The seams and poles of the faces before.
+        deg.sync(topo);
         let (param, double) = match topo.faces[f].surf {
             Surf::Torus { .. } => torus_param(topo, f),
             _ => (base_param(topo, f), false),
@@ -765,16 +891,28 @@ fn frames_and_seams_from(topo: &mut Topo, scale: f64, at: &mut usize) -> Result<
         }
         let mut best: Option<(usize, f64, Vec<Option<Crossing>>)> = None;
         'cand: for &u0 in &cands {
-            let mut chosen: Vec<Option<Crossing>> = vec![None; loops.len()];
-            let mut cost = 0;
-            for (i, lp) in loops.iter().enumerate() {
-                let xs = crossings(topo, &param, lp, &lifts[i], u0);
+            // Where each loop crosses the meridian: a wrapping loop once,
+            // any other loop not at all, or the meridian is no seam. Only
+            // then are the wrapping loops' crossings solved for.
+            let mut sites: Vec<Option<Site>> = vec![None; loops.len()];
+            for (i, l) in lifts.iter().enumerate() {
+                let xs = crossing_sites(l, u0);
                 let wraps = End::Loop(i) == bot || End::Loop(i) == top;
                 if wraps {
                     if xs.len() != 1 {
                         continue 'cand;
                     }
-                    if !xs[0].at_start && !movable(topo, lp) {
+                    sites[i] = Some(xs[0]);
+                } else if !xs.is_empty() {
+                    continue 'cand;
+                }
+            }
+            let mut chosen: Vec<Option<Crossing>> = vec![None; loops.len()];
+            let mut cost = 0;
+            for (i, lp) in loops.iter().enumerate() {
+                if let Some(site) = sites[i] {
+                    let x = crossing_at(topo, &param, lp, &lifts[i], u0, site);
+                    if !x.at_start && !movable(topo, deg, lp) {
                         cost += 1;
                         // A crossing a hair from a vertex of the loop
                         // would split off an edge too short to be one
@@ -783,8 +921,8 @@ fn frames_and_seams_from(topo: &mut Topo, scale: f64, at: &mut usize) -> Result<
                         // rim, and a seam through one passed 2e-9 from the
                         // other, an edge the validator calls degenerate):
                         // any other meridian is better.
-                        let (e, fwd) = lp[xs[0].ci];
-                        let p = curve::eval(&topo.edges[e].curve, xs[0].t);
+                        let (e, fwd) = lp[x.ci];
+                        let p = curve::eval(&topo.edges[e].curve, x.t);
                         let ends = [topo.start((e, fwd)), topo.start((e, !fwd))];
                         if ends
                             .iter()
@@ -793,9 +931,7 @@ fn frames_and_seams_from(topo: &mut Topo, scale: f64, at: &mut usize) -> Result<
                             cost += 1000;
                         }
                     }
-                    chosen[i] = Some(xs[0]);
-                } else if !xs.is_empty() {
-                    continue 'cand;
+                    chosen[i] = Some(x);
                 }
             }
             if best.as_ref().is_none_or(|b| cost < b.0) {
@@ -811,12 +947,13 @@ fn frames_and_seams_from(topo: &mut Topo, scale: f64, at: &mut usize) -> Result<
             )));
         };
         // Put a vertex where each wrapping loop crosses the seam.
-        let end_vertex = |end: End, topo: &mut Topo| -> usize {
+        let end_vertex = |end: End, topo: &mut Topo, deg: &mut Degrees| -> usize {
             match end {
                 End::Pole(w) => {
                     let p = param.eval(0.0, w);
                     let i = topo.add_vertex(p);
                     topo.pinned[i] = true;
+                    deg.sync(topo);
                     i
                 }
                 End::Loop(i) => {
@@ -824,20 +961,20 @@ fn frames_and_seams_from(topo: &mut Topo, scale: f64, at: &mut usize) -> Result<
                     let (e, fwd) = loops[i][x.ci];
                     let vi = if x.at_start {
                         topo.start((e, fwd))
-                    } else if movable(topo, &loops[i]) {
+                    } else if movable(topo, deg, &loops[i]) {
                         topo.reseat_closed(e, x.t);
                         topo.edges[e].v0
                     } else {
                         let p = curve::eval(&topo.edges[e].curve, x.t);
-                        topo.split_edge(e, x.t, p)
+                        deg.split_edge(topo, e, x.t, p)
                     };
                     topo.pinned[vi] = true;
                     vi
                 }
             }
         };
-        let vb = end_vertex(bot, topo);
-        let vt = end_vertex(top, topo);
+        let vb = end_vertex(bot, topo, deg);
+        let vt = end_vertex(top, topo, deg);
         let fr = rotated(&param, u0);
         let (pb, pt) = (topo.verts[vb], topo.verts[vt]);
         let (curve, range) = match fr.s {
@@ -1061,8 +1198,7 @@ fn pcurves(topo: &mut Topo, scale: f64, fit_tol: f64) -> f64 {
         let mut outer = Vec::with_capacity(loops.len());
         for lp in &loops {
             if !param.has_pcurves() {
-                let l = lift_loop(topo, &param, lp, None, tol);
-                outer.push(s * area(&l) > 0.0);
+                outer.push(s * planar_loop_area(topo, &param, lp) > 0.0);
                 all_pc.push(vec![None; lp.len()]);
                 continue;
             }

@@ -380,6 +380,13 @@ pub struct Report {
     pub tangencies: Vec<Tangency>,
     /// Things worth a look, in words.
     pub notes: Vec<String>,
+    /// Reconstruction checked that no face's boundary crosses itself in
+    /// its parameter plane, the check [`crate::validate`] would make
+    /// again (it has no tolerance, so the answer cannot differ), and which
+    /// on a large faceted model was a fifth of validation. Set it to
+    /// `false` after changing a B-rep's vertices, edges or loops, so that
+    /// `validate` checks it again.
+    pub faces_uncrossed: bool,
 }
 
 /// Two surfaces of the input that touch without crossing.
