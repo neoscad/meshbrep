@@ -12,6 +12,7 @@ use crate::model::{BSpline, Curve};
 use crate::solve::solve;
 use crate::surf::Surf;
 use crate::tangency::Cont;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub(crate) struct Built {
@@ -23,7 +24,7 @@ pub(crate) struct Built {
 
 /// The point on `a ∩ b` nearest `p`.
 fn on_curve(a: &Surf, b: &Surf, p: V) -> V {
-    solve(&[*a, *b], p).0
+    solve(&[a.clone(), b.clone()], p).0
 }
 
 fn par(a: V, b: V) -> bool {
@@ -49,7 +50,7 @@ fn closed_form(s: &Surf, t: &Surf, q: V) -> Option<Exact> {
         let c = o + d * (q - o).dot(d);
         Exact::Circle(c, d, (q - c).len())
     };
-    match (*s, *t) {
+    match (s.clone(), t.clone()) {
         (Plane { n: n1, .. }, Plane { n: n2, .. }) => Some(Exact::Line(n1.cross(n2).norm())),
         (Plane { o: po, n }, Cyl { o, a, r }) => {
             let c = n.dot(a);
@@ -107,7 +108,7 @@ fn closed_form(s: &Surf, t: &Surf, q: V) -> Option<Exact> {
         {
             Some(circ(c, a))
         }
-        _ => match (s.axis(), t.axis(), *t) {
+        _ => match (s.axis(), t.axis(), t.clone()) {
             // Coaxial surfaces of revolution meet in circles, parallel
             // cylinders in lines.
             (Some((o1, d1)), Some((o2, d2)), _) if par(d1, d2) => {
@@ -237,6 +238,11 @@ pub(crate) fn make_edge(
     fit_tol: f64,
 ) -> Built {
     let (s, t) = if a.rank() <= b.rank() { (a, b) } else { (b, a) };
+    if let Some(c) = &contact
+        && let Some(b) = boundary_edge(c, s, t, p0, p1, chain, closed, fit_tol)
+    {
+        return b;
+    }
     // Two planes meet in a line whatever the point; the solve is for the
     // other pairs' circles and ellipses.
     let q = if s.is_plane() && t.is_plane() {
@@ -266,7 +272,9 @@ pub(crate) fn make_edge(
     // ellipse.
     if !closed
         && !s.is_plane()
-        && let Some(cyl) = [*s, *t].into_iter().find(|x| matches!(x, Surf::Cyl { .. }))
+        && let Some(cyl) = [s.clone(), t.clone()]
+            .into_iter()
+            .find(|x| matches!(x, Surf::Cyl { .. }))
     {
         // Interior points only: near a crossing, projection can land
         // on the other branch.
@@ -298,7 +306,21 @@ pub(crate) fn make_edge(
     // Densify until the curve is within the fit tolerance of both. The
     // number of points depends on the curve, not on the mesh: a cubic
     // interpolant's error falls with the fourth power of the spacing.
+    //
+    // On a B-spline face, a fit that is not converging is given up early:
+    // three doublings in a row that do not halve the deviation, or a
+    // deviation larger than the chain itself once the points are dense.
+    // Those are a pair that does not meet along the chain (faces nearly
+    // tangent with a gap, or a chain attributed to the wrong pair), whose
+    // points land anywhere; carrying them to 4,096 points, each a solve
+    // projecting onto the patch, cost seconds per edge on a fitted blend,
+    // and the edge fails validation either way. Analytic pairs are cheap
+    // to carry on, and keep their results.
+    let fitted = matches!(s, Surf::Spline(_)) || matches!(t, Surf::Spline(_));
+    let length: f64 = chain.windows(2).map(|w| (w[1] - w[0]).len()).sum();
     let mut n = 8;
+    let mut last = f64::INFINITY;
+    let mut stalled = 0;
     loop {
         let curve = fit(s, t, chain, n);
         let range = [0.0, 1.0];
@@ -306,8 +328,132 @@ pub(crate) fn make_edge(
         if dev < fit_tol || n >= 4096 {
             return Built { curve, range, dev };
         }
+        stalled = if dev > 0.5 * last { stalled + 1 } else { 0 };
+        last = dev;
+        if fitted && (stalled >= 3 || (n >= 64 && dev > length)) {
+            return Built { curve, range, dev };
+        }
         n *= 2;
     }
+}
+
+/// The edge along a side of a B-spline patch that touches the other
+/// surface (a boundary contact): that side between the vertices, which
+/// were solved onto it. A polynomial side is its row of control points,
+/// exactly; a rational one (a blend's arc at its end) is interpolated at
+/// evenly spaced parameters of the side until within `fit_tol` of it, so
+/// that the edge's parameter is the side's (shifted to start at 0) and
+/// its parameter-space curve on the patch is a segment. `None` when the
+/// chain does not run along the side (the surfaces also meet elsewhere),
+/// for a closed chain, or when the vertices are one point of it.
+#[allow(clippy::too_many_arguments)]
+fn boundary_edge(
+    c: &Cont,
+    a: &Surf,
+    b: &Surf,
+    p0: V,
+    p1: V,
+    chain: &[V],
+    closed: bool,
+    fit_tol: f64,
+) -> Option<Built> {
+    if closed {
+        return None;
+    }
+    let mid = chain[chain.len() / 2];
+    let (s, sd) = c.nearest_side(mid)?;
+    // The chain must follow the side, not another intersection of the two
+    // surfaces, which lies a distance of the order of the model away. Its
+    // mesh vertices were put on the contact, but a tessellation leaves
+    // them only near it: a vertex conformed to the other face's polygon
+    // lies on the polygon's facet, inside the exact face by up to the
+    // polygon's sagitta (measured once moved back onto that face along
+    // its normal, which undoes that); a kernel's boolean adds vertices on
+    // the chords between them, and where the contact runs along a ridge
+    // of the polygon and bulges across it, the chain follows the ridge.
+    // Since the two surfaces are tangent along the whole side, any chain
+    // between them near it can only be the contact: the chain is
+    // accepted while it stays within a fifth of the patch's width across
+    // the side (the distance to its opposite side), or 1e-4 of its own
+    // length.
+    let other = match a {
+        Surf::Spline(x) if Arc::ptr_eq(x, s) => b,
+        _ => a,
+    };
+    let onto = |q: V| {
+        let mut x = q;
+        for _ in 0..3 {
+            let g = other.grad(x);
+            if !g.is_finite() || g.len() == 0.0 {
+                return q;
+            }
+            x = x - g.norm() * other.f(x);
+        }
+        if x.is_finite() { x } else { q }
+    };
+    let length: f64 = chain.windows(2).map(|w| (w[1] - w[0]).len()).sum();
+    let param_on = |q: V| {
+        let (u, v) = s.project(q, false);
+        if sd.fixed_u { v } else { u }
+    };
+    let [olo, ohi] = s.iso_range(!sd.fixed_u);
+    let opposite = if (sd.at - olo).abs() <= (sd.at - ohi).abs() {
+        ohi
+    } else {
+        olo
+    };
+    for &q in &chain[1..chain.len() - 1] {
+        let q = onto(q);
+        let t = param_on(q);
+        let on = s.iso(sd.fixed_u, sd.at, t).0;
+        let width = (s.iso(sd.fixed_u, opposite, t).0 - on).len();
+        let near = (1e-4 * length).max(0.2 * width);
+        if (on - q).len() > near {
+            return None;
+        }
+    }
+    let (t0, t1) = (param_on(p0), param_on(p1));
+    let span = (t1 - t0).abs();
+    let [lo, hi] = s.iso_range(sd.fixed_u);
+    if span <= 1e-12 * (hi - lo) || span.is_nan() {
+        return None;
+    }
+    let (curve, range) = match s.boundary_curve(sd.fixed_u, sd.at) {
+        Some(bs) if t0 < t1 => (Curve::BSpline(bs), [t0, t1]),
+        Some(bs) => {
+            // Reversed, so that it runs from `p0` to `p1` with an
+            // increasing parameter: t ↦ lo + hi - t.
+            let rev = BSpline {
+                degree: bs.degree,
+                control: bs.control.iter().rev().copied().collect(),
+                knots: bs.knots.iter().rev().map(|&k| lo + hi - k).collect(),
+            };
+            (Curve::BSpline(rev), [lo + hi - t0, lo + hi - t1])
+        }
+        None => {
+            let at = |tau: f64| s.iso(sd.fixed_u, sd.at, t0 + (t1 - t0) * (tau / span)).0;
+            let mut n = 8;
+            loop {
+                let taus: Vec<f64> = (0..=n).map(|k| span * k as f64 / n as f64).collect();
+                let mut pts: Vec<[f64; 3]> = taus.iter().map(|&tau| at(tau).arr()).collect();
+                pts[0] = p0.arr();
+                pts[n] = p1.arr();
+                let bs = bspline::interpolate_at(&pts, &taus);
+                let err = (0..n)
+                    .map(|k| {
+                        let tau = 0.5 * (taus[k] + taus[k + 1]);
+                        (V::from(bspline::eval(&bs, tau)) - at(tau)).len()
+                    })
+                    .fold(0.0, f64::max);
+                if err < 0.5 * fit_tol || n >= 4096 {
+                    break (Curve::BSpline(bs), [0.0, span]);
+                }
+                n *= 2;
+            }
+        }
+    };
+    let dev = deviation(&curve, range, a, b);
+    Some(Built { curve, range, dev })
 }
 
 /// A cubic through `n + 1` points spaced evenly in length along the chain
@@ -366,11 +512,11 @@ pub(crate) fn deviation(c: &Curve, range: [f64; 2], a: &Surf, b: &Surf) -> f64 {
 /// The largest distance of the chain's points from the curve, measured as
 /// the distance to their projection onto both surfaces.
 pub(crate) fn chain_deviation(a: &Surf, b: &Surf, chain: &[V]) -> f64 {
-    if let (Surf::Plane { n: na, .. }, Surf::Plane { n: nb, .. }) = (*a, *b) {
+    if let (Surf::Plane { n: na, .. }, Surf::Plane { n: nb, .. }) = (a, b) {
         // The distance to the planes' line in closed form: the shortest
         // step δ with nₐ·δ = -rₐ and n_b·δ = -r_b has |δ|² = rᵀG⁻¹r, G the
         // normals' Gram matrix.
-        let c = na.dot(nb);
+        let c = na.dot(*nb);
         let det = 1.0 - c * c;
         if det > 1e-12 {
             return chain
