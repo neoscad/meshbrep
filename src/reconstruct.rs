@@ -936,6 +936,25 @@ pub(crate) fn build(
             if digons.len() == 1 { "" } else { "s" }
         ));
     }
+    // After the collapses, which can join a needle's two sides at its
+    // base.
+    let needles = topo.remove_needles(tol);
+    if needles > 0 {
+        for e in &mut topo.edges {
+            e.faces = [NONE, NONE];
+        }
+        for (fi, f) in topo.faces.iter().enumerate() {
+            for lp in &f.loops {
+                for &(e, fwd) in lp {
+                    topo.edges[e].faces[if fwd { 0 } else { 1 }] = fi;
+                }
+            }
+        }
+        topo.notes.push(format!(
+            "{needles} needle{} of no width removed (two faces meeting along a line through a third)",
+            if needles == 1 { "" } else { "s" }
+        ));
+    }
     let n_tangent = tangent_at.iter().filter(|t| t.is_some()).count();
     if n_tangent > 0 {
         topo.notes.push(format!(

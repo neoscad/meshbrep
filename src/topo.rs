@@ -30,6 +30,46 @@ impl TEdge {
     pub fn closed(&self) -> bool {
         self.v0 == self.v1
     }
+
+    /// Whether the edge is a spike of no width: its two corners are one
+    /// point (within `tol`), and its mesh chain runs out and back along
+    /// itself, point for point. At a vertex where four blends meet, all
+    /// tangent (the end of an L-bracket rounded in two passes, where a
+    /// convex arc's torus touches the wall at the corner of its concave
+    /// blend), the polygonal tools leave the wall a needle between two
+    /// strips of the torus, its two sides one chain of mesh edges out and
+    /// back. The wall meets the torus in a figure of eight through that
+    /// corner, and the edge fitted between the chain's ends, which solve
+    /// to the same point, ran round a whole lobe of it: a face boundary
+    /// OCCT rejects (`BadOrientationOfSubshape`, fillet corpus seed 2
+    /// models 19 and 1009). A needle bounds nothing; the edge goes as a
+    /// short one does.
+    pub fn retraced(&self, verts: &[V], tol: f64) -> bool {
+        let c = &self.chain;
+        if c.len() < 3 || (verts[self.v0] - verts[self.v1]).len() >= tol {
+            return false;
+        }
+        (0..c.len() / 2).all(|i| (c[i] - c[c.len() - 1 - i]).len() < tol)
+    }
+
+    /// Whether the edge (of length `l`) is a contact the exact model does
+    /// not have: its two corners are one point (within `tol`), and the
+    /// curve fitted between them is a wisp of under a thousand times
+    /// `tol` while the mesh's chain runs on for twice that or more. Where
+    /// two faces touch beside a third at one point (a rotated box's
+    /// rounded edge and a cone's rim, fillet corpus seed 2 model 192) the
+    /// polygons meet along a chain 0.27 long whose ends solve to the same
+    /// corner; the B-spline fitted between them was 3.5e-7 long, and the
+    /// validator rightly called it degenerate. A closed curve the model has
+    /// is followed by its fit all round.
+    pub fn stray(&self, verts: &[V], l: f64, tol: f64) -> bool {
+        let c = &self.chain;
+        if c.len() < 2 || (verts[self.v0] - verts[self.v1]).len() >= tol || l >= 1e3 * tol {
+            return false;
+        }
+        let along: f64 = c.windows(2).map(|w| (w[1] - w[0]).len()).sum();
+        along >= 2.0 * l
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +225,195 @@ impl Topo {
         n
     }
 
+    /// Splits line edge `e` at existing vertex `v`, which lies on it
+    /// strictly inside its range, updating every loop that uses it. Returns
+    /// the new edge (the part from `v` to the old end).
+    fn split_line_at(&mut self, e: usize, v: usize) -> usize {
+        let t = curve::param_of(&self.edges[e].curve, self.verts[v]);
+        let mut second = self.edges[e].clone();
+        second.v0 = v;
+        second.range[0] = t;
+        second.chain = Vec::new();
+        self.edges[e].v1 = v;
+        self.edges[e].range[1] = t;
+        self.edges[e].chain = Vec::new();
+        let ne = self.edges.len();
+        self.edges.push(second);
+        for f in &mut self.faces {
+            for lp in &mut f.loops {
+                let mut out = Vec::with_capacity(lp.len() + 1);
+                for &(x, fwd) in lp.iter() {
+                    if x == e {
+                        if fwd {
+                            out.push((e, true));
+                            out.push((ne, true));
+                        } else {
+                            out.push((ne, false));
+                            out.push((e, false));
+                        }
+                    } else {
+                        out.push((x, fwd));
+                    }
+                }
+                *lp = out;
+            }
+        }
+        ne
+    }
+
+    /// Removes needles: a face whose loop runs out along a straight edge
+    /// and straight back along another, a spike of no width between two
+    /// other faces. Where a blend ends square on another blend (a block on
+    /// a plate rounded in two passes: the vertical edge's convex blend
+    /// ends at the top of the concave blend round the block's foot), three
+    /// faces meet along one line: the step the convex blend's end leaves,
+    /// the concave blend tangent to the wall, and the wall. The mesh gives
+    /// the wall a strip of no width along it, and the wall's boundary
+    /// came out touching itself (fillet corpus seed 2 models 1404, 1823,
+    /// 1899): a corner of the wall on another of its edges, which the
+    /// validator refuses. The two faces either side of the needle meet
+    /// along its line instead: the longer edge is split at the shorter's
+    /// far corner, and the needle's two edges become one between them.
+    /// Returns how many were removed.
+    pub fn remove_needles(&mut self, tol: f64) -> usize {
+        let mut gone = vec![false; self.edges.len()];
+        let mut n = 0;
+        let end = |t: &Topo, (e, fwd): (usize, bool)| {
+            let e = &t.edges[e];
+            if fwd { e.v1 } else { e.v0 }
+        };
+        let users = |t: &Topo, e: usize| -> Vec<usize> {
+            (0..t.faces.len())
+                .filter(|&f| t.faces[f].loops.iter().flatten().any(|c| c.0 == e))
+                .collect()
+        };
+        let line =
+            |t: &Topo, e: usize| matches!(t.edges[e].curve, Curve::Line { .. }) && !t.edges[e].seam;
+        while n < 1000 {
+            // The first needle in face, loop and coedge order.
+            let mut found = None;
+            'search: for f in 0..self.faces.len() {
+                for l in 0..self.faces[f].loops.len() {
+                    let lp = &self.faces[f].loops[l];
+                    let k = lp.len();
+                    if k < 3 {
+                        continue;
+                    }
+                    for i in 0..k {
+                        let (c1, c2) = (lp[i], lp[(i + 1) % k]);
+                        if c1.0 == c2.0 || !line(self, c1.0) || !line(self, c2.0) {
+                            continue;
+                        }
+                        let (a, b, c) = (self.start(c1), end(self, c1), end(self, c2));
+                        if self.start(c2) != b || a == b || b == c {
+                            continue;
+                        }
+                        let (d1, d2) =
+                            (self.verts[b] - self.verts[a], self.verts[c] - self.verts[b]);
+                        let (l1, l2) = (d1.len(), d2.len());
+                        if l1 <= tol || l2 <= tol {
+                            continue;
+                        }
+                        // Back along the same line: antiparallel, and the
+                        // far corner of each on the other's line.
+                        if d1.dot(d2) >= 0.0
+                            || d1.cross(d2).len() > 1e-9 * l1 * l2
+                            || (self.verts[c] - self.verts[a]).cross(d1).len() > tol * l1
+                        {
+                            continue;
+                        }
+                        let (u1, u2) = (users(self, c1.0), users(self, c2.0));
+                        let other = |u: &[usize]| -> Option<usize> {
+                            match u {
+                                [x, y] if *x == f => Some(*y),
+                                [x, y] if *y == f => Some(*x),
+                                _ => None,
+                            }
+                        };
+                        if let (Some(g1), Some(g2)) = (other(&u1), other(&u2))
+                            && g1 != g2
+                        {
+                            found = Some((f, c1, c2, a, c, l1, l2));
+                            break 'search;
+                        }
+                    }
+                }
+            }
+            let Some((f, c1, c2, a, c, l1, l2)) = found else {
+                break;
+            };
+            // The needle as two coedges of `f`, `x` out from `p` to `q` and
+            // `y` back, each the whole of its edge.
+            let (x, y) = if (l1 - l2).abs() <= tol {
+                if a != c {
+                    // The far corners are one point: join them.
+                    for ed in &mut self.edges {
+                        if ed.v0 == c {
+                            ed.v0 = a;
+                        }
+                        if ed.v1 == c {
+                            ed.v1 = a;
+                        }
+                    }
+                }
+                (c1, c2)
+            } else if l2 > l1 {
+                let e2 = c2.0;
+                let ne = self.split_line_at(e2, a);
+                gone.push(false);
+                // `c2` ran from the tip back past `a`: its part up to `a`
+                // is the needle's return.
+                (c1, if c2.1 { (e2, true) } else { (ne, false) })
+            } else {
+                let e1 = c1.0;
+                let ne = self.split_line_at(e1, c);
+                gone.push(false);
+                (if c1.1 { (ne, true) } else { (e1, false) }, c2)
+            };
+            // `f` drops both; the face beyond `y` takes `x` in its place,
+            // running the way `y`'s other use did (the way `x` runs in
+            // `f`).
+            for lp in &mut self.faces[f].loops {
+                lp.retain(|&co| co != x && co != y);
+            }
+            for g in 0..self.faces.len() {
+                if g == f {
+                    continue;
+                }
+                for lp in &mut self.faces[g].loops {
+                    for co in lp.iter_mut() {
+                        if co.0 == y.0 {
+                            *co = x;
+                        }
+                    }
+                }
+            }
+            self.faces[f].loops.retain(|lp| !lp.is_empty());
+            gone[y.0] = true;
+            n += 1;
+        }
+        if n == 0 {
+            return 0;
+        }
+        let mut renum = vec![usize::MAX; self.edges.len()];
+        let mut kept = Vec::with_capacity(self.edges.len());
+        for (i, ed) in std::mem::take(&mut self.edges).into_iter().enumerate() {
+            if !gone[i] {
+                renum[i] = kept.len();
+                kept.push(ed);
+            }
+        }
+        self.edges = kept;
+        for f in &mut self.faces {
+            for lp in &mut f.loops {
+                for c in lp.iter_mut() {
+                    c.0 = renum[c.0];
+                }
+            }
+        }
+        n
+    }
+
     /// Collapses open edges shorter than `tol`, joining their two vertices.
     ///
     /// The mesh can leave two corners a hair apart where the exact model
@@ -216,7 +445,8 @@ impl Topo {
             if ed.closed() || ed.seam {
                 continue;
             }
-            if length(ed) >= tol {
+            let l = length(ed);
+            if l >= tol && !ed.retraced(&self.verts, tol) && !ed.stray(&self.verts, l, tol) {
                 continue;
             }
             let (keep, drop) = (ed.v0, ed.v1);
@@ -483,5 +713,169 @@ impl Topo {
         }
         let v = ed.v0;
         self.verts[v] = p;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(t: &Topo, a: usize, b: usize, chain: Vec<V>) -> TEdge {
+        let (p, q) = (t.verts[a], t.verts[b]);
+        TEdge {
+            v0: a,
+            v1: b,
+            curve: Curve::Line {
+                origin: p.arr(),
+                direction: (q - p).norm().arr(),
+            },
+            range: [0.0, (q - p).len()],
+            faces: [usize::MAX; 2],
+            chain,
+            seam: false,
+            dev: 0.0,
+            chain_dev: 0.0,
+        }
+    }
+
+    fn face(n: V, loops: Vec<Vec<(usize, bool)>>) -> TFace {
+        TFace {
+            surf: Surf::Plane {
+                o: v(0.0, 0.0, 0.0),
+                n,
+            },
+            same_sense: true,
+            faceted: false,
+            loops,
+            param: None,
+            pcurves: Vec::new(),
+            outer: Vec::new(),
+            tris: Vec::new(),
+            source: Vec::new(),
+        }
+    }
+
+    /// A wall (face 0) whose loop runs out along the line from corner 1
+    /// to the tip, corner 2, and back past corner 1 to corner 0: a needle
+    /// between face 1 (beyond the edge out) and face 2 (beyond the edge
+    /// back), as a block's foot rounded in two passes left it. The needle
+    /// goes, and faces 1 and 2 share its line.
+    #[test]
+    fn a_needle_between_two_faces_becomes_their_edge() {
+        let mut t = Topo::default();
+        for p in [
+            v(0.0, 0.0, 0.0),
+            v(10.0, 0.0, 0.0),
+            v(12.0, 0.0, 0.0),
+            v(10.0, 0.0, 5.0),
+            v(0.0, 0.0, 5.0),
+        ] {
+            t.add_vertex(p);
+        }
+        // 0: 1 -> 2 (out), 1: 0 -> 2 (the long edge back), 2: 1 -> 3,
+        // 3: 3 -> 4, 4: 4 -> 0.
+        let es = [
+            line(&t, 1, 2, Vec::new()),
+            line(&t, 0, 2, Vec::new()),
+            line(&t, 1, 3, Vec::new()),
+            line(&t, 3, 4, Vec::new()),
+            line(&t, 4, 0, Vec::new()),
+        ];
+        t.edges.extend(es);
+        let y = v(0.0, 1.0, 0.0);
+        t.faces = vec![
+            face(
+                y,
+                vec![vec![
+                    (2, false),
+                    (0, true),
+                    (1, false),
+                    (4, false),
+                    (3, false),
+                ]],
+            ),
+            face(v(0.0, 0.0, 1.0), vec![vec![(0, false)]]),
+            face(v(0.0, 0.0, -1.0), vec![vec![(1, true)]]),
+        ];
+        assert_eq!(t.remove_needles(1e-9), 1);
+        // The wall keeps the long edge's part from corner 0 to corner 1.
+        let end = |t: &Topo, (e, fwd): (usize, bool)| {
+            if fwd { t.edges[e].v1 } else { t.edges[e].v0 }
+        };
+        let wall: Vec<(usize, usize)> = t.faces[0].loops[0]
+            .iter()
+            .map(|&c| (t.start(c), end(&t, c)))
+            .collect();
+        assert_eq!(wall, vec![(3, 1), (1, 0), (0, 4), (4, 3)]);
+        // Faces 1 and 2 now share one edge from corner 1 to the tip.
+        let e1 = t.faces[1].loops[0][0];
+        let e2 = *t.faces[2].loops[0].last().expect("edge");
+        assert_eq!(e1.0, e2.0);
+        assert_ne!(e1.1, e2.1);
+        let ed = &t.edges[e1.0];
+        let mut ends = [ed.v0, ed.v1];
+        ends.sort_unstable();
+        assert_eq!(ends, [1, 2]);
+        assert_eq!(t.edges.len(), 5);
+    }
+
+    /// A loop that only turns back on itself at an angle is no needle.
+    #[test]
+    fn a_corner_is_not_a_needle() {
+        let mut t = Topo::default();
+        for p in [v(0.0, 0.0, 0.0), v(10.0, 0.0, 0.0), v(0.0, 0.0, 5.0)] {
+            t.add_vertex(p);
+        }
+        let es = [
+            line(&t, 0, 1, Vec::new()),
+            line(&t, 1, 2, Vec::new()),
+            line(&t, 2, 0, Vec::new()),
+        ];
+        t.edges.extend(es);
+        t.faces = vec![
+            face(
+                v(0.0, 1.0, 0.0),
+                vec![vec![(0, true), (1, true), (2, true)]],
+            ),
+            face(
+                v(0.0, -1.0, 0.0),
+                vec![vec![(2, false), (1, false), (0, false)]],
+            ),
+        ];
+        assert_eq!(t.remove_needles(1e-9), 0);
+    }
+
+    /// An edge whose two corners are one point and whose chain runs out
+    /// and back along itself is a needle's; one whose chain goes round is
+    /// not.
+    #[test]
+    fn a_retraced_chain_is_a_needle() {
+        let mut t = Topo::default();
+        for p in [v(0.0, 0.0, 0.0), v(0.0, 0.0, 1e-15)] {
+            t.add_vertex(p);
+        }
+        let mut e = line(&t, 0, 1, vec![t.verts[0], v(0.4, 0.1, 0.0), t.verts[1]]);
+        assert!(e.retraced(&t.verts, 1e-9));
+        e.chain = vec![t.verts[0], v(0.4, 0.1, 0.0), v(0.5, 0.3, 0.0), t.verts[1]];
+        assert!(!e.retraced(&t.verts, 1e-9));
+    }
+
+    /// An edge between two corners at one point whose fitted curve is a
+    /// wisp while its mesh chain runs on is a contact the model does not
+    /// have; one whose chain is as short, or whose corners are apart, is
+    /// not.
+    #[test]
+    fn a_wisp_between_one_point_is_stray() {
+        let mut t = Topo::default();
+        for p in [v(0.0, 0.0, 0.0), v(1e-8, 0.0, 0.0)] {
+            t.add_vertex(p);
+        }
+        let mut e = line(&t, 0, 1, vec![t.verts[0], v(0.2, 0.1, 0.0), t.verts[1]]);
+        assert!(e.stray(&t.verts, 3e-7, 4e-8));
+        e.chain = vec![t.verts[0], t.verts[1]];
+        assert!(!e.stray(&t.verts, 3e-7, 4e-8));
+        t.verts[1] = v(1e-3, 0.0, 0.0);
+        e.chain = vec![t.verts[0], v(0.2, 0.1, 0.0), t.verts[1]];
+        assert!(!e.stray(&t.verts, 3e-7, 4e-8));
     }
 }

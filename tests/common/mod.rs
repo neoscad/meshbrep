@@ -383,6 +383,21 @@ pub fn case(name: &str) -> (Node, Option<f64>) {
         "x10" => (Sphere(7.0, ID), Some(4.0 * PI * 343.0 / 3.0)),
         // cylinder(r1=5, r2=0, h=10): a cone with its apex in the face.
         "x11" => (Cyl(10.0, 5.0, 0.0, ID), Some(250.0 * PI / 3.0)),
+        // intersection(){sphere(10); rotate([36.8699, -1.7184, 0]) cube(20);}:
+        // an eighth of a ball turned so that the z axis runs through its
+        // sphere face 0.03 radians from one of its quarter circles. A frame
+        // about z (whose pole is then inside the face, beside its boundary)
+        // let the seam to that pole cross the boundary in parameter space.
+        "x12" => (
+            op(
+                'I',
+                vec![
+                    Sphere(10.0, ID),
+                    cube(20.0, 20.0, 20.0, false, rot(36.8699, -1.7184, 0.0)),
+                ],
+            ),
+            Some(PI * 1000.0 / 6.0),
+        ),
         // A fillet as CSG: difference(){cube(20); translate([17,17,-1]) difference(){cube([4,4,22]); cylinder(r=3,h=22);}}
         "f01" => (
             op(
@@ -492,7 +507,7 @@ pub const FIFTEEN: [&str; 15] = [
     "c14", "c15",
 ];
 pub const IDIOMS: [&str; 6] = ["x01", "x02", "x03", "x04", "x05", "x06"];
-pub const MORE: [&str; 7] = ["x07", "x08", "x09", "x10", "x11", "f01", "f02"];
+pub const MORE: [&str; 8] = ["x07", "x08", "x09", "x10", "x11", "x12", "f01", "f02"];
 pub const TORI: [&str; 8] = ["t01", "t02", "t03", "t04", "t05", "t06", "t07", "t08"];
 
 /// The volume of sphere(10) ∩ cube(15, center = true): the sphere less six

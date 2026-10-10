@@ -2,8 +2,10 @@
 
 ## Unreleased
 
-Faster on large and faceted models; the same B-rep and the same STEP
-bytes for every input.
+Faster on large and faceted models, and sounder reconstruction where
+blends meet tangentially. The speed-ups alone give the same B-rep and
+STEP bytes for every input; the reconstruction fixes change the output
+only for models that failed or, for turned sphere patches, had a seam.
 
 - `Report::faces_uncrossed`: set by reconstruction, which checks every
   face's boundary for crossing itself; `validate` then does not check
@@ -25,6 +27,22 @@ bytes for every input.
 - Fewer allocations elsewhere: half-edge pairing by a counting sort,
   vertex lookup by index, in-place Gauss–Newton steps, planar loop
   areas without sample vectors.
+- Needles (a face's loop running out along a straight edge and back
+  along another, a strip of no width between two faces, as a convex
+  blend ending square on a concave one leaves) are removed after the
+  collapses: the two faces either side share the needle's line. Before,
+  the face's boundary touched itself and reconstruction failed.
+- An open edge whose two corners are one point is collapsed when its
+  mesh chain runs out and back along itself (it ran round a whole lobe
+  of a plane's figure of eight with a torus, a face OCCT rejects), or
+  when its fitted curve is a wisp under a thousand times the merge
+  tolerance while its chain runs on (the validator called it
+  degenerate).
+- A sphere face's frame, past its bounding circles' own normals, keeps
+  both poles outside the face: a turned box corner's patch kept the z
+  axis with its pole inside, 0.03 radians from the boundary, and the
+  seam to it crossed the boundary in parameter space. Such patches now
+  have no seam and write about a quarter of the bytes (test case `x12`).
 
 ## 0.3.0
 

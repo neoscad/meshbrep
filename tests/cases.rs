@@ -321,3 +321,26 @@ fn needles_thinner_than_the_tolerance_are_flipped() {
     let vol = measure(&b).unwrap().volume;
     assert!((vol - 257.25).abs() < 1e-7, "{vol}");
 }
+
+/// A sphere face whose boundary has no shared normal (x12: an eighth of a
+/// ball, turned so that the z axis runs through the face 0.03 radians from
+/// one of its quarter circles) is framed with both poles outside it, not
+/// about z with a seam to a pole inside: on a box corner's patch turned
+/// the same way (fillet corpus seed 2 model 900) that seam crossed the
+/// boundary in parameter space and the corner was written as facets. No
+/// seam, and a quarter of the file.
+#[test]
+fn a_turned_sphere_patch_keeps_its_poles_outside() {
+    for res in RESOLUTIONS {
+        let (mesh, _, _) = tagged("x12", res);
+        let b = reconstruct(&mesh, &Options::default()).unwrap();
+        assert!(
+            b.edges.iter().all(|e| !e.seam),
+            "x12 {}: a seam ({})",
+            res.name(),
+            kinds(&b)
+        );
+        let v = validate(&b, 1e-6);
+        assert!(v.is_valid(), "x12 {}: {:?}", res.name(), v.errors);
+    }
+}

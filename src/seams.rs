@@ -444,11 +444,29 @@ fn base_param(topo: &Topo, f: usize) -> Param {
             ] {
                 cands.push(V::from(d).norm());
             }
+            // Past the bounding circles' own normals (a cap's circle as a
+            // parallel round its pole), an axis is taken only with both
+            // poles outside the face as well: a box corner's patch turned
+            // by arbitrary angles kept the fixed z axis, whose pole lay
+            // inside the patch 0.03 radians from its boundary, and the
+            // seam to that pole crossed the boundary in parameter space
+            // (fillet corpus seed 2 model 900).
+            let own = counts.len();
+            let reach = face_reach(topo, face, c, mean);
             let z = cands
                 .iter()
-                .copied()
-                .find(|&z| clear_of_poles(topo, face, c, r, z))
-                .unwrap_or(cands[0]);
+                .enumerate()
+                .find(|&(i, &z)| {
+                    clear_of_poles(topo, face, c, r, z)
+                        && (i < own || reach.is_none_or(|(m, cos)| m.dot(z).abs() < cos))
+                })
+                .or_else(|| {
+                    cands
+                        .iter()
+                        .enumerate()
+                        .find(|&(_, &z)| clear_of_poles(topo, face, c, r, z))
+                })
+                .map_or(cands[0], |(_, &z)| z);
             Param::new(face.surf.clone(), c, z, z.perp(), 0.0)
         }
         Surf::Torus { .. } => torus_param(topo, f).0,
@@ -465,6 +483,27 @@ pub(crate) fn spline_param(surf: Surf, s: &crate::nurbs::Spline) -> Param {
     let d = s.ders(u, v, 1);
     let z = d[1][0].cross(d[0][1]).norm();
     Param::new(surf, d[0][0], z, d[1][0], 0.0)
+}
+
+/// The direction of a sphere face's boundary from the centre `c` (its
+/// samples' mean `mean`, unit), and the cosine of the angle beyond which
+/// an axis's pole is clear of the face: past every boundary sample's
+/// angle from that direction by 0.05 radians. `None` when the boundary has
+/// no mean direction (a great circle).
+fn face_reach(topo: &Topo, face: &crate::topo::TFace, c: V, mean: V) -> Option<(V, f64)> {
+    if mean.len() <= 1e-6 {
+        return None;
+    }
+    let m = mean.norm();
+    let mut least: f64 = 1.0;
+    for &(e, _) in face.loops.iter().flatten() {
+        let ed = &topo.edges[e];
+        for p in curve::sample(&ed.curve, ed.range, 16) {
+            least = least.min((p - c).norm().dot(m));
+        }
+    }
+    let angle = libm::acos(least.clamp(-1.0, 1.0)) + 0.05;
+    Some((m, if angle >= PI { -1.0 } else { cos(angle) }))
 }
 
 /// Whether no boundary of `face` (on the sphere `c`, `r`) comes near the
