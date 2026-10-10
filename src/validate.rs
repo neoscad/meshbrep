@@ -918,7 +918,7 @@ fn face_touch_search(b: &Brep, fi: usize, tol: f64) -> Option<String> {
             {
                 continue;
             }
-            if distance_to_curve(&e.curve, e.range, pts, p) <= tol {
+            if within(&e.curve, e.range, pts, p, tol) {
                 return Some(format!(
                     "face {fi}: boundary touches itself, a corner at ({:.4}, {:.4}, {:.4}) lies on edge {ei} ({})",
                     p.x,
@@ -1011,12 +1011,36 @@ fn small_face_touches(b: &Brep, f: &crate::model::Face, tol: f64) -> bool {
             {
                 continue;
             }
-            if distance_to_curve(&e.curve, e.range, &pts, p) <= tol {
+            if within(&e.curve, e.range, &pts, p, tol) {
                 return true;
             }
         }
     }
     false
+}
+
+/// Whether `p` is within `tol` of a curve sampled as `pts` over `range`,
+/// by [`distance_to_curve`].
+///
+/// For a line, a corner farther than `tol` from the whole infinite line
+/// (plus a margin far above the rounding of either distance) is not
+/// within `tol` of any point the search evaluates, so the answer is
+/// known without it: the search costs 160 evaluations, and the touch
+/// checks ask it of most corners of a faceted model's thin faces (their
+/// boxes overlap their edges'). Any other case is the search's answer.
+fn within(c: &crate::model::Curve, range: [f64; 2], pts: &[V], p: V, tol: f64) -> bool {
+    if let crate::model::Curve::Line { origin, direction } = c {
+        let (o, d) = (V::from(*origin), V::from(*direction));
+        let dl = d.len();
+        if dl > 0.0 {
+            let off = (p - o).cross(d).len() / dl;
+            let reach = o.len() + p.len() + dl * range[0].abs().max(range[1].abs());
+            if off > tol + 1e-12 * reach {
+                return false;
+            }
+        }
+    }
+    distance_to_curve(c, range, pts, p) <= tol
 }
 
 /// The distance from `p` to a curve sampled as `pts` over `range`: from
@@ -1233,6 +1257,55 @@ mod tests {
             "{crossings} of {faces}"
         );
         assert!(touches > faces / 10, "{touches} of {faces}");
+    }
+
+    /// The line shortcut in front of the distance search answers as the
+    /// search does: on lines of every direction and length, far from the
+    /// origin and near it, with corners on the line, at the tolerance
+    /// from it (either side), and far off, at a tolerance as small as the
+    /// rounding and at the usual ones.
+    #[test]
+    fn the_line_shortcut_agrees_with_the_distance_search() {
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (mut near, mut far, mut cases) = (0, 0, 0);
+        for i in 0..20_000 {
+            let scale = [1e-3, 1.0, 1e3, 1e6][i % 4];
+            let o = v(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5) * scale;
+            let d = v(rnd() - 0.5, rnd() - 0.5, rnd() - 0.5).norm();
+            let len = scale * (0.001 + rnd());
+            let curve = crate::model::Curve::Line {
+                origin: o.arr(),
+                direction: d.arr(),
+            };
+            let range = [0.0, len];
+            const N: usize = 4;
+            let pts: Vec<V> = (0..=N)
+                .map(|k| curve::eval(&curve, len * k as f64 / N as f64))
+                .collect();
+            let tol = [1e-12 * scale, 1e-9 * scale, 1e-6, 1e-3 * scale][(i / 4) % 4];
+            // A point along the line (inside and beyond the range),
+            // pushed off it by a multiple of the tolerance.
+            let along = o + d * (len * (1.4 * rnd() - 0.2));
+            let side = d.perp().norm();
+            let off = [0.0, 0.5, 1.0 - 1e-9, 1.0, 1.0 + 1e-9, 2.0, 1e3][(i / 16) % 7];
+            let p = along + side * (off * tol);
+            let search = distance_to_curve(&curve, range, &pts, p) <= tol;
+            assert_eq!(
+                within(&curve, range, &pts, p, tol),
+                search,
+                "{o:?} {d:?} {len} {p:?} {tol}"
+            );
+            cases += 1;
+            near += usize::from(search);
+            far += usize::from(!search);
+        }
+        assert!(near > cases / 10 && far > cases / 10, "{near} {far}");
     }
 
     /// `validate` makes the crossing check unless the B-rep says that

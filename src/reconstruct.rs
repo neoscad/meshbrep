@@ -467,24 +467,37 @@ pub(crate) fn build(
         c
     };
 
-    // 4. Analytic contacts between adjacent classes.
-    let mut contacts: BTreeMap<(usize, usize), Option<Cont>> = BTreeMap::new();
-    for h in 0..3 * nt {
-        let (a, b) = (tcls[h / 3], tcls[twin[h] / 3]);
-        if a < b {
-            contacts.entry((a, b)).or_insert_with(|| {
-                use_contacts
-                    .then(|| contact(&cls.surf[a], &cls.surf[b], tol, opts.tolerances.surface_fit))
-                    .flatten()
-            });
-        }
-    }
+    // 4. Analytic contacts between adjacent classes: each pair once, in
+    // order. A sorted list rather than a map filled half-edge by half-edge
+    // (a map lookup for each of a large faceted model's millions of
+    // half-edges was a tenth of its reconstruction); `contact` depends
+    // only on the pair, so computing it in pair order changes nothing.
+    let mut pairs: Vec<(usize, usize)> = (0..3 * nt)
+        .filter_map(|h| {
+            let (a, b) = (tcls[h / 3], tcls[twin[h] / 3]);
+            (a < b).then_some((a, b))
+        })
+        .collect();
+    pairs.sort_unstable();
+    pairs.dedup();
+    let pair_contacts: Vec<Option<Cont>> = pairs
+        .iter()
+        .map(|&(a, b)| {
+            use_contacts
+                .then(|| contact(&cls.surf[a], &cls.surf[b], tol, opts.tolerances.surface_fit))
+                .flatten()
+        })
+        .collect();
     let contact_of = |a: usize, b: usize| -> Option<Cont> {
         let k = if a < b { (a, b) } else { (b, a) };
-        contacts.get(&k).cloned().flatten()
+        pairs
+            .binary_search(&k)
+            .ok()
+            .and_then(|i| pair_contacts[i].clone())
     };
-    let tangencies: Vec<(u32, u32, Cont)> = contacts
+    let tangencies: Vec<(u32, u32, Cont)> = pairs
         .iter()
+        .zip(&pair_contacts)
         .filter_map(|(&(a, b), c)| {
             let c = c.clone()?;
             Some((cls.input[a]?, cls.input[b]?, c))
@@ -690,21 +703,26 @@ pub(crate) fn build(
     let mut n_merged = 0usize;
     loop {
         let mut merged = false;
-        // Ends per mesh vertex.
-        let mut at: BTreeMap<u32, Vec<(usize, bool)>> = BTreeMap::new();
+        // Ends per mesh vertex, by vertex, each vertex's in chain order
+        // (a stable sort of a list rather than a map: a map entry per
+        // chain end was a twentieth of a large faceted model's
+        // reconstruction, and it is rebuilt after every merge).
+        let mut ends_at: Vec<(u32, usize, bool)> = Vec::with_capacity(2 * chains.len());
         for (i, ch) in chains.iter().enumerate() {
             if !alive[i] || ch.closed {
                 continue;
             }
-            at.entry(ch.verts[0]).or_default().push((i, true));
-            at.entry(*ch.verts.last().expect("chain"))
-                .or_default()
-                .push((i, false));
+            ends_at.push((ch.verts[0], i, true));
+            ends_at.push((*ch.verts.last().expect("chain"), i, false));
         }
-        for (&p, uses) in &at {
-            if uses.len() != 2 || vfaces[p as usize].len() != 2 {
+        ends_at.sort_by_key(|e| e.0);
+        let groups = ends_at.chunk_by(|x, y| x.0 == y.0);
+        for group in groups {
+            let p = group[0].0;
+            if group.len() != 2 || vfaces[p as usize].len() != 2 {
                 continue;
             }
+            let uses = [(group[0].1, group[0].2), (group[1].1, group[1].2)];
             let ((i, i_start), (j, j_start)) = (uses[0], uses[1]);
             if i == j {
                 continue;
@@ -1051,7 +1069,17 @@ fn place_vertex(
     if cl.iter().all(|&c| cls.faceted[c]) {
         return (pos[p], residual(pos[p]));
     }
-    let mut taken = vec![false; cl.len()];
+    // Which classes a contact took, on the stack for the few around a
+    // corner (a vector per corner was two fifths of placing the corners
+    // of a large faceted model).
+    let mut few = [false; 16];
+    let mut many = Vec::new();
+    let taken: &mut [bool] = if cl.len() <= few.len() {
+        &mut few[..cl.len()]
+    } else {
+        many.resize(cl.len(), false);
+        &mut many
+    };
     let mut cons: Vec<Surf> = Vec::new();
     let mut sides: Vec<(std::sync::Arc<Spline>, Side)> = Vec::new();
     // Sides of the contacts not taken above (each face takes part in one):
@@ -1640,12 +1668,15 @@ fn classes(
             break;
         }
     }
-    // Each group's plane: its largest triangle's.
-    let mut group_best: BTreeMap<usize, (f64, usize)> = BTreeMap::new();
+    // Each group's plane: its largest triangle's. Per group root (a
+    // triangle index), in vectors rather than maps: a large faceted model
+    // has a group per facet, and the map lookups were a fifth of finding
+    // its classes.
+    let mut group_best: Vec<Option<(f64, usize)>> = vec![None; nt];
     for t in 0..nt {
         if let Some((_, a)) = planes[t] {
             let r = uf.find(t);
-            let e = group_best.entry(r).or_insert((a, t));
+            let e = group_best[r].get_or_insert((a, t));
             if a > e.0 {
                 *e = (a, t);
             }
@@ -1653,38 +1684,38 @@ fn classes(
     }
     // A faceted group lying in an adjacent exact plane joins it: the
     // first such neighbour in triangle order.
-    let mut joins: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut joins: Vec<Option<usize>> = vec![None; nt];
     for t in 0..nt {
         if !is_faceted(t) {
             continue;
         }
         let r = uf.find(t);
-        let Some(&(_, bt)) = group_best.get(&r) else {
+        let Some((_, bt)) = group_best[r] else {
             continue;
         };
-        if joins.contains_key(&r) {
+        if joins[r].is_some() {
             continue;
         }
         let plane = planes[bt].as_ref().expect("plane").0.clone();
         for k in 0..3 {
             let w = twin[3 * t + k] / 3;
             if !is_faceted(w) && surf[of_tri[w]].same(&plane, tol) {
-                joins.insert(r, of_tri[w]);
+                joins[r] = Some(of_tri[w]);
                 break;
             }
         }
     }
-    let mut class_of_group: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut class_of_group: Vec<Option<usize>> = vec![None; nt];
     for t in 0..nt {
         if !is_faceted(t) {
             continue;
         }
         let r = uf.find(t);
-        if let Some(&c) = class_of_group.get(&r) {
+        if let Some(c) = class_of_group[r] {
             of_tri[t] = c;
             continue;
         }
-        let Some(&(_, bt)) = group_best.get(&r) else {
+        let Some((_, bt)) = group_best[r] else {
             // Slivers of no area between exact faces (a faceted mesh's
             // edge snapped onto an exact one): they take an exact
             // neighbour's surface; with no area they add nothing to it.
@@ -1699,8 +1730,8 @@ fn classes(
             of_tri[t] = of_tri[w];
             continue;
         };
-        let c = match joins.get(&r) {
-            Some(&c) => c,
+        let c = match joins[r] {
+            Some(c) => c,
             None => {
                 surf.push(planes[bt].as_ref().expect("plane").0.clone());
                 faceted.push(true);
@@ -1708,7 +1739,7 @@ fn classes(
                 surf.len() - 1
             }
         };
-        class_of_group.insert(r, c);
+        class_of_group[r] = Some(c);
         of_tri[t] = c;
     }
     Ok(Classes {

@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 Faster on large and faceted models, and sounder reconstruction where
 blends meet tangentially. The speed-ups alone give the same B-rep and
@@ -27,6 +27,19 @@ only for models that failed or, for turned sphere patches, had a seam.
 - Fewer allocations elsewhere: half-edge pairing by a counting sort,
   vertex lookup by index, in-place Gauss–Newton steps, planar loop
   areas without sample vectors.
+- The STEP writer formats whole numbers without the formatting
+  machinery, keeps the text of reals it has written (by their bits) to
+  copy when they recur, writes the most common entities (points' users,
+  edges, loops, faces) without `format!`, and assembles the file in the
+  buffer it writes to: about half the time on large faceted models, the
+  same bytes.
+- Reconstruction finds the contacts between adjacent classes from a
+  sorted list of pairs instead of a map filled per half-edge, the ends of
+  chains for arc merging likewise, a faceted group's plane and class by
+  index rather than by map, and keeps a corner's flags on the stack; the
+  touch checks skip the distance search for a corner farther than the
+  tolerance from a straight edge's whole line. A tenth to a quarter less
+  reconstruction time on large faceted models, the same B-rep.
 - Needles (a face's loop running out along a straight edge and back
   along another, a strip of no width between two faces, as a convex
   blend ending square on a concave one leaves) are removed after the

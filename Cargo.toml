@@ -1,6 +1,6 @@
 [package]
 name = "meshbrep"
-version = "0.3.0"
+version = "0.4.0"
 description = "Rebuild an exact B-rep (planes, cylinders, cones, spheres, tori, B-spline surfaces) from a triangle mesh tagged with the surface each triangle came from, write it as STEP AP214, and make fillet and chamfer tools"
 edition = "2024"
 rust-version = "1.88"

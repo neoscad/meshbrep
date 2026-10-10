@@ -93,6 +93,9 @@ fn push_real(out: &mut String, x: f64, scratch: &mut String) {
         out.push_str("0.");
         return;
     }
+    if push_integral(out, x) {
+        return;
+    }
     scratch.clear();
     let _ = write!(scratch, "{x:E}");
     let (mant, exp) = scratch.split_once('E').expect("exponent");
@@ -103,6 +106,126 @@ fn push_real(out: &mut String, x: f64, scratch: &mut String) {
     if exp != "0" {
         out.push('E');
         out.push_str(exp);
+    }
+}
+
+/// [`push_real`] of a whole number below 2^53 in magnitude, without the
+/// formatting machinery: CAD coordinates and directions often are (a
+/// cube's corners, an axis's 1). Returns `false`, having written nothing,
+/// for any other `x`.
+///
+/// The text is the one `{:E}` gives. Below 2^53 consecutive doubles are at
+/// most 1 apart, so a whole number's shortest round-trip digits are its
+/// own decimal digits without their trailing zeros: any other string of
+/// that many digits or fewer is at least 1 away, outside the half-unit
+/// that would read back as the same double (and no tie between two
+/// candidates can arise).
+fn push_integral(out: &mut String, x: f64) -> bool {
+    const LIMIT: f64 = 9_007_199_254_740_992.0; // 2^53
+    let a = x.abs();
+    if !a.is_finite() || a >= LIMIT || a.fract() != 0.0 || a == 0.0 {
+        return false;
+    }
+    let mut v = a as u64;
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    let digits = &buf[i..];
+    let exponent = digits.len() - 1;
+    let mut end = digits.len();
+    while end > 1 && digits[end - 1] == b'0' {
+        end -= 1;
+    }
+    if x < 0.0 {
+        out.push('-');
+    }
+    out.push(char::from(digits[0]));
+    out.push('.');
+    for &d in &digits[1..end] {
+        out.push(char::from(d));
+    }
+    if exponent > 0 {
+        out.push('E');
+        push_uint(out, exponent);
+    }
+    true
+}
+
+/// Reals already formatted, by their bits: a direct-mapped cache in front
+/// of [`push_real`]. A faceted model writes each coordinate several times
+/// (a vertex's point, the lines that start there, the planes through it),
+/// and the shortest round-trip formatting is half of writing it. A hit
+/// copies the text the same bits gave before, so the file is the same
+/// with or without it.
+struct Reals {
+    slots: Vec<Slot>,
+    /// log2 of the number of slots.
+    bits: u32,
+    scratch: String,
+}
+
+#[derive(Clone, Copy)]
+struct Slot {
+    bits: u64,
+    /// 0 for an empty slot (no real's text is empty).
+    len: u8,
+    text: [u8; Reals::MAX_LEN],
+}
+
+impl Reals {
+    /// The longest text [`push_real`] gives: a sign, 17 digits, the point,
+    /// `E`, the exponent's sign and three digits.
+    const MAX_LEN: usize = 24;
+
+    /// A cache for about `reals` distinct values: a slot each, from 256
+    /// to 65,536 (2.6 MB). Sized by the model, since setting up the
+    /// largest for a cube took longer than writing it.
+    fn new(reals: usize) -> Reals {
+        Reals {
+            slots: Vec::new(),
+            bits: reals.next_power_of_two().trailing_zeros().clamp(8, 16),
+            scratch: String::new(),
+        }
+    }
+
+    fn push(&mut self, out: &mut String, x: f64) {
+        if x == 0.0 {
+            out.push_str("0.");
+            return;
+        }
+        if push_integral(out, x) {
+            return;
+        }
+        if self.slots.is_empty() {
+            self.slots = vec![
+                Slot {
+                    bits: 0,
+                    len: 0,
+                    text: [0; Reals::MAX_LEN],
+                };
+                1 << self.bits
+            ];
+        }
+        let bits = x.to_bits();
+        let at = (bits.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - self.bits)) as usize;
+        let slot = &mut self.slots[at];
+        if slot.len > 0 && slot.bits == bits {
+            let text = &slot.text[..slot.len as usize];
+            out.push_str(std::str::from_utf8(text).expect("ASCII"));
+            return;
+        }
+        let start = out.len();
+        push_real(out, x, &mut self.scratch);
+        let text = &out.as_bytes()[start..];
+        if text.len() <= Reals::MAX_LEN {
+            slot.bits = bits;
+            slot.len = text.len() as u8;
+            slot.text[..text.len()].copy_from_slice(text);
+        }
     }
 }
 
@@ -136,17 +259,20 @@ struct W {
     body: String,
     /// Entities numbered so far.
     n: usize,
-    scratch: String,
+    reals: Reals,
     /// Reserved entities: number, offset in `body`, and text once set.
     holes: Vec<(usize, usize, String)>,
 }
 
 impl W {
-    fn new() -> W {
+    /// A writer for a B-rep of about `vertices` vertices.
+    fn new(vertices: usize) -> W {
         W {
             body: String::new(),
             n: 0,
-            scratch: String::new(),
+            // Three coordinates a vertex, and as many again for the
+            // lines and planes whose points are not vertices.
+            reals: Reals::new(6 * vertices),
             holes: Vec::new(),
         }
     }
@@ -193,11 +319,40 @@ impl W {
             if i > 0 {
                 self.body.push(',');
             }
-            push_real(&mut self.body, x, &mut self.scratch);
+            self.reals.push(&mut self.body, x);
         }
         self.body.push_str("))");
         self.finish();
         id
+    }
+    /// `#i`.
+    fn id(&mut self, i: usize) {
+        self.body.push('#');
+        push_uint(&mut self.body, i);
+    }
+    /// `#a,#b,...`, as [`Refs`] formats it.
+    fn ids(&mut self, xs: &[usize]) {
+        for (k, &i) in xs.iter().enumerate() {
+            if k > 0 {
+                self.body.push(',');
+            }
+            self.id(i);
+        }
+    }
+    /// `KIND('',#a,#b,...)` and its number: the entities that refer only
+    /// to others, written without the formatting machinery (a faceted
+    /// model has millions of them).
+    fn refers(&mut self, kind: &str, xs: &[usize]) -> usize {
+        let n = self.start();
+        self.body.push_str(kind);
+        self.body.push_str("(''");
+        for &i in xs {
+            self.body.push(',');
+            self.id(i);
+        }
+        self.body.push(')');
+        self.finish();
+        n
     }
     fn pt(&mut self, p: [f64; 3]) -> usize {
         self.tuple("CARTESIAN_POINT", &p)
@@ -212,23 +367,26 @@ impl W {
         let p = self.pt(o);
         let a = self.dir(z);
         let b = self.dir(x);
-        self.addf(format_args!("AXIS2_PLACEMENT_3D('',#{p},#{a},#{b})"))
+        self.refers("AXIS2_PLACEMENT_3D", &[p, a, b])
     }
-    /// The DATA section's lines, reserved entities in their places.
-    fn into_data(self, out: &mut String) {
-        let mut at = 0;
+    /// The file: the buffer with reserved entities in their places (the
+    /// last first, so that the earlier offsets still hold) and the
+    /// trailer.
+    fn into_file(self) -> String {
+        let mut body = self.body;
         let mut holes = self.holes;
         holes.sort_by_key(|h| h.1);
-        for (id, off, text) in holes {
-            out.push_str(&self.body[at..off]);
-            out.push('#');
-            push_uint(out, id);
-            out.push('=');
-            out.push_str(&text);
-            out.push_str(";\n");
-            at = off;
+        for (id, off, text) in holes.into_iter().rev() {
+            let mut line = String::with_capacity(text.len() + 24);
+            line.push('#');
+            push_uint(&mut line, id);
+            line.push('=');
+            line.push_str(&text);
+            line.push_str(";\n");
+            body.insert_str(off, &line);
         }
-        out.push_str(&self.body[at..]);
+        body.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
+        body
     }
 }
 
@@ -286,8 +444,12 @@ fn curve_entity(w: &mut W, c: &Curve) -> usize {
         Curve::Line { origin, direction } => {
             let p = w.pt(*origin);
             let d = w.dir(*direction);
-            let vct = w.addf(format_args!("VECTOR('',#{d},1.)"));
-            w.addf(format_args!("LINE('',#{p},#{vct})"))
+            let vct = w.start();
+            w.body.push_str("VECTOR('',");
+            w.id(d);
+            w.body.push_str(",1.)");
+            w.finish();
+            w.refers("LINE", &[p, vct])
         }
         Curve::Circle {
             center,
@@ -425,7 +587,7 @@ fn surface_entity(w: &mut W, f: &Face) -> usize {
             real(*major_radius),
             real(*minor_radius)
         )),
-        _ => w.addf(format_args!("PLANE('',#{a})")),
+        _ => w.refers("PLANE", &[a]),
     }
 }
 
@@ -477,7 +639,31 @@ fn void_parents(b: &Brep) -> Vec<Option<usize>> {
 /// millimetres, with parameter-space curves on curved faces and seam
 /// curves on periodic ones.
 pub fn write_step(brep: &Brep, opts: &StepOptions) -> String {
-    let mut w = W::new();
+    // The header goes first in the buffer the entities are appended to,
+    // so the file is that buffer: assembling it in a second one copied the
+    // whole file (a tenth of writing a large one).
+    let mut header = String::new();
+    header.push_str("ISO-10303-21;\nHEADER;\n");
+    let _ = writeln!(
+        header,
+        "FILE_DESCRIPTION(({}),'2;1');",
+        string(&opts.description)
+    );
+    let _ = writeln!(
+        header,
+        "FILE_NAME({},{},({}),({}),{},{},'');",
+        string(&opts.file_name),
+        string(&opts.timestamp),
+        string(&opts.author),
+        string(&opts.organization),
+        string("meshbrep"),
+        string(&opts.originating_system)
+    );
+    header.push_str(
+        "FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }'));\nENDSEC;\nDATA;\n",
+    );
+    let mut w = W::new(brep.vertices.len());
+    w.body.push_str(&header);
     // About what a model of straight edges and planar faces takes (a
     // little over), so the buffer is not copied as it doubles.
     w.body
@@ -523,7 +709,7 @@ pub fn write_step(brep: &Brep, opts: &StepOptions) -> String {
         .iter()
         .map(|&p| {
             let q = w.pt(p);
-            w.addf(format_args!("VERTEX_POINT('',#{q})"))
+            w.refers("VERTEX_POINT", &[q])
         })
         .collect();
     // Each edge's parameter-space curves, in face order.
@@ -563,10 +749,12 @@ pub fn write_step(brep: &Brep, opts: &StepOptions) -> String {
                 };
                 w.addf(format_args!("{kind}('',#{c3},({}),.PCURVE_S1.)", Refs(&ps)))
             };
-            w.addf(format_args!(
-                "EDGE_CURVE('',#{},#{},#{geom},.T.)",
-                vids[e.start as usize], vids[e.end as usize]
-            ))
+            let n = w.start();
+            w.body.push_str("EDGE_CURVE('',");
+            w.ids(&[vids[e.start as usize], vids[e.end as usize], geom]);
+            w.body.push_str(",.T.)");
+            w.finish();
+            n
         })
         .collect();
     let parents = void_parents(brep);
@@ -580,31 +768,45 @@ pub fn write_step(brep: &Brep, opts: &StepOptions) -> String {
                     .coedges
                     .iter()
                     .map(|c| {
-                        w.addf(format_args!(
-                            "ORIENTED_EDGE('',*,*,#{},{})",
-                            eids[c.edge as usize],
-                            if c.forward { ".T." } else { ".F." }
-                        ))
+                        let n = w.start();
+                        w.body.push_str("ORIENTED_EDGE('',*,*,");
+                        w.id(eids[c.edge as usize]);
+                        w.body.push_str(if c.forward { ",.T.)" } else { ",.F.)" });
+                        w.finish();
+                        n
                     })
                     .collect();
-                let l = w.addf(format_args!("EDGE_LOOP('',({}))", Refs(&oes)));
+                let l = w.start();
+                w.body.push_str("EDGE_LOOP('',(");
+                w.ids(&oes);
+                w.body.push_str("))");
+                w.finish();
                 let kind = if lp.outer {
                     "FACE_OUTER_BOUND"
                 } else {
                     "FACE_BOUND"
                 };
-                w.addf(format_args!(
-                    "{kind}('',#{l},{})",
-                    if flip { ".F." } else { ".T." }
-                ))
+                let n = w.start();
+                w.body.push_str(kind);
+                w.body.push_str("('',");
+                w.id(l);
+                w.body.push_str(if flip { ",.F.)" } else { ",.T.)" });
+                w.finish();
+                n
             })
             .collect();
-        w.addf(format_args!(
-            "ADVANCED_FACE('',({}),#{},{})",
-            Refs(&bounds),
-            sids[fi],
-            if f.same_sense != flip { ".T." } else { ".F." }
-        ))
+        let n = w.start();
+        w.body.push_str("ADVANCED_FACE('',(");
+        w.ids(&bounds);
+        w.body.push_str("),");
+        w.id(sids[fi]);
+        w.body.push_str(if f.same_sense != flip {
+            ",.T.)"
+        } else {
+            ",.F.)"
+        });
+        w.finish();
+        n
     };
     let mut shell_ids = Vec::with_capacity(brep.shells.len());
     for sh in &brep.shells {
@@ -650,28 +852,7 @@ pub fn write_step(brep: &Brep, opts: &StepOptions) -> String {
         format!("SHAPE_DEFINITION_REPRESENTATION(#{pds},#{rep})"),
     );
 
-    let data: usize = w.body.len() + w.holes.iter().map(|h| h.2.len() + 24).sum::<usize>();
-    let mut s = String::with_capacity(data + 1024);
-    s.push_str("ISO-10303-21;\nHEADER;\n");
-    let _ = writeln!(
-        s,
-        "FILE_DESCRIPTION(({}),'2;1');",
-        string(&opts.description)
-    );
-    let _ = writeln!(
-        s,
-        "FILE_NAME({},{},({}),({}),{},{},'');",
-        string(&opts.file_name),
-        string(&opts.timestamp),
-        string(&opts.author),
-        string(&opts.organization),
-        string("meshbrep"),
-        string(&opts.originating_system)
-    );
-    s.push_str("FILE_SCHEMA(('AUTOMOTIVE_DESIGN { 1 0 10303 214 1 1 1 1 }'));\nENDSEC;\nDATA;\n");
-    w.into_data(&mut s);
-    s.push_str("ENDSEC;\nEND-ISO-10303-21;\n");
-    s
+    w.into_file()
 }
 
 #[cfg(test)]
@@ -689,6 +870,67 @@ mod tests {
         assert_eq!(real(-2.5e-12), "-2.5E-12");
         for x in [0.1, 1.0 / 3.0, 123456.789, -1e300, 5e-324] {
             assert_eq!(real(x).parse::<f64>().unwrap(), x);
+        }
+    }
+
+    /// The shortcuts in front of `{:E}` (whole numbers, and reals seen
+    /// before) give its text exactly: on whole numbers of every length up
+    /// to 2^53 and just past it, on random bit patterns, and on values
+    /// repeated many times over so that the cache's slots are reused and
+    /// overwritten.
+    #[test]
+    fn real_shortcuts_give_the_formatted_text() {
+        let slow = |x: f64| {
+            let mut out = String::new();
+            if x == 0.0 {
+                out.push_str("0.");
+                return out;
+            }
+            let s = format!("{x:E}");
+            let (mant, exp) = s.split_once('E').unwrap();
+            out.push_str(mant);
+            if !mant.contains('.') {
+                out.push('.');
+            }
+            if exp != "0" {
+                out.push('E');
+                out.push_str(exp);
+            }
+            out
+        };
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut values: Vec<f64> = Vec::new();
+        for k in 0..=54 {
+            let p = 2f64.powi(k);
+            values.extend([p - 1.0, p, p + 1.0, -p, 10f64.powi(k.min(22))]);
+        }
+        values.extend([1.0, -1.0, 15.0, 100.0, 1e15, 1.5, 0.1, 1e-7, 5e-324]);
+        for _ in 0..20_000 {
+            let r = rnd();
+            values.push(f64::from_bits(r));
+            values.push((r % 2_000_001) as f64 - 1_000_000.0);
+            values.push((r % 1_000_000) as f64 / 64.0);
+            values.push(((r >> 11) as f64) * 1e-3);
+        }
+        values.retain(|x| x.is_finite());
+        let (mut small, mut large) = (Reals::new(0), Reals::new(1 << 20));
+        for round in 0..3 {
+            for &x in &values {
+                for cache in [&mut small, &mut large] {
+                    let mut fast = String::new();
+                    cache.push(&mut fast, x);
+                    assert_eq!(fast, slow(x), "{x:?} (round {round})");
+                }
+                let mut plain = String::new();
+                push_real(&mut plain, x, &mut String::new());
+                assert_eq!(plain, slow(x), "{x:?}");
+            }
         }
     }
 
